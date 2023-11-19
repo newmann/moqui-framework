@@ -27,6 +27,15 @@ along with this software (see the LICENSE.md file). If not, see
         <xs:enumeration value="hidden"/>
     </xs:restriction></xs:simpleType>
 
+    <xs:simpleType name="moqui-key-type">
+        <xs:annotation><xs:documentation>Define hot-key, only one alphabet
+            or digit need.</xs:documentation></xs:annotation>
+        <xs:restriction base="xs:string">
+            <xs:length value="1"/>
+            <xs:pattern value="[0-9A-Za-z]"/>
+        </xs:restriction>
+    </xs:simpleType>
+
     <xs:element name="parameter"><xs:complexType>
         <xs:attribute name="name" type="xs:string" use="required"/>
         <xs:attribute name="from" type="xs:string"/>
@@ -507,6 +516,7 @@ along with this software (see the LICENSE.md file). If not, see
         <xs:attribute name="entity-name" type="xs:string"/>
         <xs:attribute name="entity-key-name" type="xs:string"/>
         <xs:attribute name="entity-use-cache" default="true" type="boolean"/>
+        <xs:attribute name="moqui-key" type="moqui-key-type"/>
     </xs:complexType></xs:element>
 
     <xs:element name="image" substitutionGroup="StandaloneFields"><xs:complexType>
@@ -774,6 +784,8 @@ along with this software (see the LICENSE.md file). If not, see
         <xs:attribute name="validate-parameter" type="xs:string"/>
         <xs:attribute name="validate-entity" type="xs:string"/>
         <xs:attribute name="validate-field" type="xs:string"/>
+        <xs:attribute name="moqui-key" type="moqui-key-type"/>
+
     </xs:complexType>
     <xs:complexType name="form-list-conditional-field"><xs:complexContent><xs:extension base="form-list-default-field">
         <xs:attribute name="condition" type="xs:string" use="required">
