@@ -38,6 +38,18 @@ dependencyUpdates.resolutionStrategy { componentSelection { rules -> rules.all {
 
 // NOTE: packages should match group, name, version found at https://bintray.com/bintray/jcenter
 repositories {
+    maven { url 'http://maven.aliyun.com/nexus/content/groups/public'
+        allowInsecureProtocol = true
+    }
+    maven { url 'http://maven.aliyun.com/nexus/content/repositories/jcenter'
+        allowInsecureProtocol = true
+    }
+    maven { url 'https://maven.aliyun.com/repository/jcenter' }
+    maven { url 'https://maven.aliyun.com/repository/google' }
+    maven { url 'https://mirrors.cloud.tencent.com/gradle/'}
+    maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/' }
+    maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+
     flatDir name: 'localLib', dirs: projectDir.absolutePath + '/lib'
     mavenCentral()
 }
