@@ -1,0 +1,16 @@
+{
+  "index_patterns": ["*"],
+  "priority": 10,
+  "template": {
+    "settings": {
+      "index": {
+        "analysis": {
+          "analyzer": {
+            "default": { "type": "ik_max_word" },
+            "default_search": { "type": "ik_smart" }
+          }
+        }
+      }
+    }
+  }
+}

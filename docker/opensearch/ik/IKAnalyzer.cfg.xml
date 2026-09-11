@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE properties SYSTEM "http://java.sun.com/dtd/properties.dtd">
+<properties>
+    <comment>IK Analyzer extra dictionaries (local files; restart OpenSearch after edits)</comment>
+    <entry key="ext_dict">custom/ext_dict.dic</entry>
+    <entry key="ext_stopwords">custom/ext_stopwords.dic</entry>
+</properties>

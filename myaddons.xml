@@ -1,0 +1,39 @@
+<addons default-repository="github">
+    <!--
+    ========== MODIFYING THIS FILE NOT RECOMMENDED ==========
+
+    Contains known open source Moqui components, those in the GitHub 'moqui' group and others.
+
+    To add or override repository, runtime, and component elements use a "myaddons.xml" file.
+    
+    .\gradlew getComponent -Pcomponent=collie-fasm
+    .\gradlew getComponentSet -PcomponentSet=newmann-tool
+    .\gradlew getComponentSet -PcomponentSet=mantle
+
+    -->
+
+
+    <!-- Where to get runtime directory if not present -->
+    <runtime name="moqui-runtime" group="newmann" version="4.0.0" branch="master"/>
+
+
+    <!-- Mantle Business Artifact and Integration Components -->
+    <component name="mantle-udm" group="newmann" version="2.2.1" branch="master"/>
+    <component name="mantle-usl" group="newmann" version="3.0.0" branch="master"/>
+
+    <!-- 中文版 -->
+    <component name="framework-zh_CN" group="newmann" version="4.0.0" branch="master"/>
+    <component name="base-component-zh_CN" group="newmann" version="4.0.0" branch="master"/>
+    <component name="mantle-udm-zh_CN" group="newmann" version="2.2.1" branch="master"/>
+    <component name="mantle-usl-zh_CN" group="newmann" version="3.0.0" branch="master"/>
+
+    <!-- 个人组件 -->
+    <component name="qapps2" group="newmann" version="1.0.0" branch="master"/>
+    <component name="collie-flowable" group="newmann" version="1.0.0" branch="master"/>
+    <component name="collie-wf-flowable" group="newmann" version="1.0.0" branch="master"/>
+    <component name="collie-fasm" group="newmann" version="1.0.0" branch="master"/>
+
+    <component-set name="mantle" components="mantle-udm,mantle-usl,framework-zh_CN,base-component-zh_CN,mantle-udm-zh_CN,mantle-usl-zh_CN,my-component"/>
+    <component-set name="newmann-tool" components="qapps2,collie-flowable,collie-wf-flowable"/>
+
+</addons>
