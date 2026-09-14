@@ -696,9 +696,13 @@ public abstract class EntityValueBase implements EntityValue {
 
                 // don't skip for this, if a field was reset then we want to record that: if (!value) continue
 
-                // check for a changeReason
+                // check for a changeReason (context first, then current request so custom services need not declare it)
                 String changeReason = null;
-                Object changeReasonObj = ec.contextStack.getByString(fieldName.concat("_changeReason"));
+                String changeReasonName = fieldName.concat("_changeReason");
+                Object changeReasonObj = ec.contextStack.getByString(changeReasonName);
+                if (changeReasonObj == null && ec.getWeb() != null) {
+                    changeReasonObj = ec.getWeb().getParameters().get(changeReasonName);
+                }
                 if (changeReasonObj != null) {
                     changeReason = changeReasonObj.toString();
                     if (changeReason.isEmpty()) changeReason = null;
