@@ -103,33 +103,54 @@ services:
     entrypoint: ["sh", "-c", "tr -d '\\r' < /setup-index-template.sh | sh"]
     restart: "no"
 
-  moqui-minio:
-    image: minio/minio:latest
-    container_name: moqui-minio
+  moqui-rustfs:
+    image: rustfs/rustfs:1.0.0-rc.6
+    container_name: moqui-rustfs
     restart: always
-    command: server /data --console-address ":9001"
+    command: ["/data"]
     ports:
       - 127.0.0.1:9000:9000
       - 127.0.0.1:9001:9001
     volumes:
-      - ./minio/data:/data
+      - ./rustfs/data:/data
     environment:
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ADDRESS=:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=colliedrive
+      - RUSTFS_SECRET_KEY=colliedrive-dev
+      - RUSTFS_OBS_LOGGER_LEVEL=error
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
-  moqui-minio-init:
+  moqui-rustfs-init:
     image: minio/mc:latest
-    container_name: moqui-minio-init
+    container_name: moqui-rustfs-init
     depends_on:
-      - moqui-minio
+      - moqui-rustfs
     entrypoint: >
       /bin/sh -c "
-      sleep 3;
-      mc alias set local http://moqui-minio:9000 minioadmin minioadmin;
+      sleep 5;
+      mc alias set local http://moqui-rustfs:9000 colliedrive colliedrive-dev;
       mc mb -p local/knowledge-base || true;
+      mc mb -p local/collie-drive || true;
       exit 0;
       "
     restart: "no"
+
+  moqui-kkfileview:
+    image: keking/kkfileview
+    container_name: moqui-kkfileview
+    restart: always
+    ports:
+      - 127.0.0.1:8012:8012
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - KK_BASE_URL=http://127.0.0.1:8012
 
   opensearch-dashboards:
     image: opensearchproject/opensearch-dashboards:3.4.0

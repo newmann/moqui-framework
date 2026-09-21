@@ -32,6 +32,8 @@ build
 !/docker/certs/moqui2.local.*
 !/docker/certs/moqui.local.*
 !/docker/certs/README
+/docker/minio/
+/docker/rustfs/ 
 
 # IntelliJ IDEA files
 .idea
