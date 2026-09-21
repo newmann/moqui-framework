@@ -24,7 +24,8 @@ import org.moqui.context.ExecutionContext
 @Suite
 @SelectClasses([ CacheFacadeTests.class, EntityCrud.class, EntityFindTests.class, EntityNoSqlCrud.class,
         L10nFacadeTests.class, MessageFacadeTests.class, ResourceFacadeTests.class, ServiceCrudImplicit.class,
-        ServiceFacadeTests.class, SubSelectTests.class, TransactionFacadeTests.class, UserFacadeTests.class,
+        ServiceFacadeTests.class, SubSelectTests.class, TransactionFacadeTests.class, 
+        TransactionCacheDbTests.class, UserFacadeTests.class,
         SystemScreenRenderTests.class, ToolsRestApiTests.class, ToolsScreenRenderTests.class,
         SecurityAccessControlTests.class, SecurityAuthnTests.class, SecurityInjectionTests.class,
         SecurityMisconfigTests.class, SecurityCryptoTests.class, SecurityIntegrityTests.class,

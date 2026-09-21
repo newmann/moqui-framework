@@ -44,6 +44,9 @@ import org.moqui.impl.context.ContextJavaUtil.ArtifactHitInfo
 import org.moqui.impl.context.ContextJavaUtil.CustomScheduledExecutor
 import org.moqui.impl.context.ContextJavaUtil.ScheduledRunnableInfo
 import org.moqui.impl.entity.EntityFacadeImpl
+import org.moqui.impl.llm.LlmFacadeImpl
+import org.moqui.impl.llm.a2a.A2AFacadeImpl
+import org.moqui.llm.a2a.A2AFacade
 import org.moqui.impl.screen.ScreenFacadeImpl
 import org.moqui.impl.service.ServiceFacadeImpl
 import org.moqui.impl.webapp.NotificationWebSocketListener
@@ -144,6 +147,8 @@ class ExecutionContextFactoryImpl implements ExecutionContextFactory {
     @SuppressWarnings("GrFinalVariableAccess") public final TransactionFacadeImpl transactionFacade
     @SuppressWarnings("GrFinalVariableAccess") public final EntityFacadeImpl entityFacade
     @SuppressWarnings("GrFinalVariableAccess") public final ElasticFacadeImpl elasticFacade
+    @SuppressWarnings("GrFinalVariableAccess") public final LlmFacadeImpl llmFacade
+    @SuppressWarnings("GrFinalVariableAccess") public final A2AFacadeImpl a2aFacade
     @SuppressWarnings("GrFinalVariableAccess") public final ServiceFacadeImpl serviceFacade
     @SuppressWarnings("GrFinalVariableAccess") public final ScreenFacadeImpl screenFacade
 
@@ -241,6 +246,9 @@ class ExecutionContextFactoryImpl implements ExecutionContextFactory {
         // NOTE: ElasticFacade init after postFacadeInit() so finds embedded from moqui-elasticsearch if present, can move up once moqui-elasticsearch deprecated
         elasticFacade = new ElasticFacadeImpl(this)
         logger.info("Elastic Facade initialized")
+        llmFacade = new LlmFacadeImpl(this)
+        a2aFacade = new A2AFacadeImpl(this)
+        logger.info("Llm Facade initialized")
 
         logger.info("Execution Context Factory initialized in ${(System.currentTimeMillis() - initStartTime)/1000} seconds")
     }
@@ -301,6 +309,9 @@ class ExecutionContextFactoryImpl implements ExecutionContextFactory {
         // NOTE: ElasticFacade init after postFacadeInit() so finds embedded from moqui-elasticsearch if present, can move up once moqui-elasticsearch deprecated
         elasticFacade = new ElasticFacadeImpl(this)
         logger.info("Elastic Facade initialized")
+        llmFacade = new LlmFacadeImpl(this)
+        a2aFacade = new A2AFacadeImpl(this)
+        logger.info("Llm Facade initialized")
 
         logger.info("Execution Context Factory initialized in ${(System.currentTimeMillis() - initStartTime)/1000} seconds")
     }
@@ -882,6 +893,7 @@ class ExecutionContextFactoryImpl implements ExecutionContextFactory {
 
         // this destroy order is important as some use others so must be destroyed first
         if (this.serviceFacade != null) this.serviceFacade.destroy()
+        if (this.llmFacade != null) this.llmFacade.destroy()
         if (this.elasticFacade != null) this.elasticFacade.destroy()
         if (this.entityFacade != null) this.entityFacade.destroy()
         if (this.transactionFacade != null) this.transactionFacade.destroy()
@@ -1003,6 +1015,7 @@ class ExecutionContextFactoryImpl implements ExecutionContextFactory {
     // ====================================================
 
     @Override @Nonnull ExecutionContext getExecutionContext() { return getEci() }
+    @Override ExecutionContext getActiveExecutionContext() { return activeContext.get() }
     ExecutionContextImpl getEci() {
         // the ExecutionContextImpl cast here looks funny, but avoids Groovy using a slow castToType call
         ExecutionContextImpl ec = (ExecutionContextImpl) activeContext.get()
@@ -1058,6 +1071,8 @@ class ExecutionContextFactoryImpl implements ExecutionContextFactory {
     @Override @Nonnull TransactionFacade getTransaction() { transactionFacade }
     @Override @Nonnull EntityFacade getEntity() { entityFacade }
     @Override @Nonnull ElasticFacade getElastic() { elasticFacade }
+    @Override @Nonnull LlmFacade getLlm() { llmFacade }
+    @Override @Nonnull A2AFacade getA2A() { a2aFacade }
     @Override @Nonnull ServiceFacade getService() { serviceFacade }
     @Override @Nonnull ScreenFacade getScreen() { screenFacade }
 
@@ -1699,6 +1714,17 @@ class ExecutionContextFactoryImpl implements ExecutionContextFactory {
             MNode efBaseNode = baseNode.first("elastic-facade")
             MNode efOverrideNode = overrideNode.first("elastic-facade")
             efBaseNode.mergeChildrenByKey(efOverrideNode, "cluster", "name", null)
+        }
+
+        if (overrideNode.hasChild("llm-facade")) {
+            baseNode.mergeChildWithChildKey(overrideNode, "llm-facade", "profile", "name",
+                    { MNode childBaseNode, MNode childOverrideNode ->
+                childBaseNode.mergeChildrenByKey(childOverrideNode, "header", "name", null)
+                childBaseNode.mergeChildrenByKey(childOverrideNode, "query", "name", null)
+                childBaseNode.mergeChildrenByKey(childOverrideNode, "allowed-path", "prefix", null)
+                childBaseNode.mergeChildrenByKey(childOverrideNode, "allowed-service", "name", null)
+                childBaseNode.mergeChildrenByKey(childOverrideNode, "allowed-entity", "name", null)
+            })
         }
 
         if (overrideNode.hasChild("entity-facade")) {

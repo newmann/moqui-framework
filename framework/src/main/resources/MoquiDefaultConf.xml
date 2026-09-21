@@ -47,7 +47,7 @@
     -->
     <default-property name="user_privileged_groups" value="ADMIN,ADMIN_ADV"/>
     <default-property name="user_sealed_permissions"
-            value="GROOVY_SHELL_WEB,SQL_RUNNER_WEB,SERVICE_LOAD_RUNNER,ADMIN_LOGIN_AS,ADMIN_PASSWORD,ElasticRemote,KibanaRemote,REST_SCHEMA"/>
+            value="GROOVY_SHELL_WEB,SQL_RUNNER_WEB,SERVICE_LOAD_RUNNER,ADMIN_LOGIN_AS,ADMIN_PASSWORD,ElasticRemote,KibanaRemote,REST_SCHEMA,LlmGateway"/>
 
     <!--
         email_allowed_hosts: comma-separated hostnames/IPs poll#EmailServer and send#Email may connect to.
@@ -94,6 +94,32 @@
     <default-property name="elasticsearch_user" value=""/>
     <default-property name="elasticsearch_password" value="" is-secret="true"/>
     <default-property name="elasticsearch_index_prefix" value=""/>
+
+    <!-- LLM Client settings (env vars / Java properties; see ReleaseNotes.md). url may be an origin
+         (default path /v1/chat/completions is appended) or a full chat/completions URL (Azure).
+         Blank api-key omits the auth header (Ollama). model is empty — set llm_openai_model. -->
+    <default-property name="llm_openai_url" value="https://api.openai.com"/>
+    <default-property name="llm_openai_api_key" value="" is-secret="true"/>
+    <default-property name="llm_openai_model" value=""/>
+    <default-property name="llm_log_content" value="false"/>
+    <!-- A2A server: JSON-RPC 1.0 binding at /llm/a2a/jsonrpc (auth via LlmAuthFilter) and public Agent Card at
+         /.well-known/agent-card.json. Off by default: both endpoints answer 404 until a2a_enabled is true, so an
+         upgrade never publishes an agent surface without an operator opting in.
+         a2a_public_url is the base URL advertised in the Agent Card; behind a reverse proxy or tunnel set it, or set
+         a2a_trust_forwarded_headers=true to derive it from X-Forwarded-Proto/Host. -->
+    <default-property name="a2a_enabled" value="false"/>
+    <default-property name="a2a_trust_forwarded_headers" value="false"/>
+    <default-property name="a2a_public_url" value=""/>
+    <default-property name="a2a_default_profile" value="assist"/>
+    <default-property name="a2a_agent_name" value="Moqui"/>
+    <default-property name="a2a_agent_description" value="Moqui enterprise application agent"/>
+    <default-property name="a2a_agent_version" value="1.0.0"/>
+    <default-property name="a2a_provider_organization" value=""/>
+    <default-property name="a2a_provider_url" value=""/>
+    <default-property name="a2a_max_part_bytes" value="65536"/>
+    <default-property name="a2a_max_parts" value="32"/>
+    <default-property name="a2a_replay_wait_ms" value="600000"/>
+
     <!-- Kibana Proxy Servlet settings -->
     <default-property name="kibana_host" value="127.0.0.1"/>
     <default-property name="kibana_port" value="5601"/>
@@ -185,6 +211,7 @@
         <artifact-stats type="AT_XML_SCREEN_CONTENT" persist-bin="true" persist-hit="false"/>
         <artifact-stats type="AT_XML_SCREEN_TRANS" persist-bin="true" persist-hit="true"/>
         <artifact-stats type="AT_SERVICE" persist-bin="true" persist-hit="false"/>
+        <artifact-stats type="AT_LLM" persist-bin="true" persist-hit="false"/>
         <artifact-stats type="AT_ENTITY" persist-bin="false"/>
     </server-stats>
 
@@ -226,6 +253,12 @@
                 <init-param name="permission" value="KibanaRemote"/>
                 <url-pattern>/kibana/*</url-pattern>
             </filter>
+            <!-- LLM gateway: session/Basic/login_key via MoquiAuthFilter; CSRF is checked in LlmServlet.
+                 No async-supported: service() pumps SSE on the request thread so this filter's EC stays live. -->
+            <filter name="LlmAuthFilter" class="org.moqui.impl.webapp.MoquiAuthFilter">
+                <init-param name="permission" value="LlmGateway"/>
+                <url-pattern>/llm/*</url-pattern>
+            </filter>
 
             <!-- Moqui Session Listener (necessary to handle expired sessions, etc) -->
             <listener class="org.moqui.impl.webapp.MoquiSessionListener"/>
@@ -235,6 +268,15 @@
             </servlet>
             <servlet name="MoquiFopServlet" class="org.moqui.impl.webapp.MoquiFopServlet" load-on-startup="1">
                 <url-pattern>/fop/*</url-pattern>
+            </servlet>
+            <servlet name="A2AServlet" class="org.moqui.impl.webapp.A2AServlet" load-on-startup="1">
+                <url-pattern>/llm/a2a/*</url-pattern>
+            </servlet>
+            <servlet name="A2ACardServlet" class="org.moqui.impl.webapp.A2ACardServlet" load-on-startup="1">
+                <url-pattern>/.well-known/agent-card.json</url-pattern>
+            </servlet>
+            <servlet name="LlmServlet" class="org.moqui.impl.webapp.LlmServlet" load-on-startup="1">
+                <url-pattern>/llm/*</url-pattern>
             </servlet>
 
             <!-- ElasticSearch and Kibana proxy servlets, see above for auth filters on the same url-pattern -->
@@ -293,7 +335,7 @@
             <response-header type="cors-preflight" name="Access-Control-Allow-Credentials" value="true"/>
             <!-- doesn't seem these are needed, allowed by default: ,Authorization,Referrer,User-Agent -->
             <response-header type="cors-preflight" name="Access-Control-Allow-Headers" add="true"
-                    value="Accept,Accept-Encoding,Content-Type,Content-Encoding,Origin,X-Requested-With,Access-Control-Request-Method,Access-Control-Request-Headers,api_key,login_key,X-HTTP-Method-Override,moquiSessionToken,SessionToken,X-CSRF-Token,Authorization"/>
+                    value="Accept,Accept-Encoding,Content-Type,Content-Encoding,Origin,X-Requested-With,Access-Control-Request-Method,Access-Control-Request-Headers,api_key,login_key,X-HTTP-Method-Override,moquiSessionToken,SessionToken,X-CSRF-Token,Authorization,A2A-Version"/>
             <!-- TODO: would be nice to handle this differently, ie dynamically based on preflight request path -->
             <response-header type="cors-preflight" name="Access-Control-Allow-Methods" add="true" value="GET,PUT,POST,PATCH,DELETE,OPTIONS"/>
             <response-header type="cors-preflight" name="Access-Control-Max-Age" value="3600"/>
@@ -306,6 +348,7 @@
         <artifact-execution type="AT_SERVICE" authz-enabled="true" tarpit-enabled="true"/>
         <!-- NOTE: entity tarpit disabled by default for performance and tracking overhead reasons -->
         <artifact-execution type="AT_ENTITY" authz-enabled="true" tarpit-enabled="false"/>
+        <artifact-execution type="AT_LLM" authz-enabled="true" tarpit-enabled="true"/>
     </artifact-execution-facade>
     <user-facade>
         <password encrypt-hash-type="SHA-256" min-length="8" min-digits="1" min-others="1"
@@ -350,6 +393,7 @@
         <!-- renderer class needs to implement the org.moqui.context.TemplateRenderer interface -->
         <template-renderer extension="ftl" class="org.moqui.impl.context.renderer.FtlTemplateRenderer"/>
         <template-renderer extension="html.ftl" class="org.moqui.impl.context.renderer.FtlTemplateRenderer"/>
+        <template-renderer extension="json.ftl" class="org.moqui.impl.context.renderer.FtlTemplateRenderer"/>
         <template-renderer extension="gstring" class="org.moqui.impl.context.renderer.GStringTemplateRenderer"/>
         <template-renderer extension="html.gstring" class="org.moqui.impl.context.renderer.GStringTemplateRenderer"/>
 
@@ -428,6 +472,8 @@
         <service-file location="classpath://service/org/moqui/impl/PrintServices.xml"/>
         <service-file location="classpath://service/org/moqui/impl/ScreenServices.xml"/>
         <service-file location="classpath://service/org/moqui/impl/ServerServices.xml"/>
+        <service-file location="classpath://service/org/moqui/impl/LlmServices.xml"/>
+        <service-file location="classpath://service/org/moqui/impl/A2AServices.xml"/>
         <service-file location="classpath://service/org/moqui/impl/ServiceServices.xml"/>
         <service-file location="classpath://service/org/moqui/impl/SystemMessageServices.xml"/>
         <service-file location="classpath://service/org/moqui/impl/UserServices.xml"/>
@@ -440,6 +486,15 @@
         <cluster name="default" url="${elasticsearch_host1 ?: elasticsearch_url}" user="${elasticsearch_user}" password="${elasticsearch_password}"
                 index-prefix="${elasticsearch_index_prefix}" pool-max="64" queue-size="1024"/>
     </elastic-facade>
+
+    <llm-facade enabled="true" default-profile="default">
+        <profile name="default" url="${llm_openai_url}" api-key="${llm_openai_api_key}"
+                model="${llm_openai_model}" log-content="${llm_log_content}"/>
+        <!-- No allowed-path: servlet does not attach the request tool. Add prefixes in runtime conf, e.g.:
+             <allowed-path prefix="/rest/s1/mantle/" methods="GET,POST,PUT,PATCH,DELETE"/>
+             <allowed-path prefix="/qapps/mantle/" methods="GET"/>
+             Assist profile (tools component) sets allow-unprefixed-request instead. -->
+    </llm-facade>
 
     <entity-facade default-group-name="transactional" entity-eca-enabled="true" sequenced-id-prefix=""
             distributed-cache-invalidate="false" dci-topic-factory="" query-stats="false"
@@ -544,12 +599,15 @@
         <load-entity location="classpath://entity/ServerEntities.xml"/>
         <load-entity location="classpath://entity/ServiceEntities.xml"/>
         <load-entity location="classpath://entity/TestEntities.xml"/>
+        <load-entity location="classpath://entity/LlmEntities.xml"/>
+        <load-entity location="classpath://entity/A2AEntities.xml"/>
         <!-- in framework/data -->
         <load-data location="classpath://data/CommonL10nData.xml"/>
         <load-data location="classpath://data/CurrencyData.xml"/>
         <load-data location="classpath://data/EntityTypeData.xml"/>
         <load-data location="classpath://data/GeoCountryData.xml"/>
         <load-data location="classpath://data/SecurityTypeData.xml"/>
+        <load-data location="classpath://data/LlmTypeData.xml"/>
         <load-data location="classpath://data/UnitData.xml"/>
         <load-data location="classpath://data/MoquiSetupData.xml"/>
     </entity-facade>

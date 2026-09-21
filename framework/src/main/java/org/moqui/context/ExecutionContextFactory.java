@@ -17,10 +17,12 @@ import groovy.lang.GroovyClassLoader;
 import org.moqui.entity.EntityFacade;
 import org.moqui.screen.ScreenFacade;
 import org.moqui.service.ServiceFacade;
+import org.moqui.llm.a2a.A2AFacade;
 
 import jakarta.servlet.ServletContext;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import jakarta.websocket.server.ServerContainer;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,6 +33,9 @@ import java.util.List;
 public interface ExecutionContextFactory {
     /** Get the ExecutionContext associated with the current thread or initialize one and associate it with the thread. */
     @Nonnull ExecutionContext getExecutionContext();
+
+    /** Current thread ExecutionContext, or null. Does not create one. */
+    @Nullable ExecutionContext getActiveExecutionContext();
 
     /** Destroy the active Execution Context. When another is requested in this thread a new one will be created. */
     void destroyActiveExecutionContext();
@@ -76,6 +81,12 @@ public interface ExecutionContextFactory {
 
     /** For interactions with ElasticSearch using the built in HTTP REST client. */
     @Nonnull ElasticFacade getElastic();
+
+    /** For LLM provider calls using named conf profiles. */
+    @Nonnull LlmFacade getLlm();
+
+    /** For A2A 1.0 operations; one instance for the life of the factory. */
+    @Nonnull A2AFacade getA2A();
 
     /** For calling services (local or remote, sync or async or scheduled). */
     @Nonnull ServiceFacade getService();

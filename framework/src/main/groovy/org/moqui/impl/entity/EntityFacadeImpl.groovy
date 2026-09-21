@@ -29,7 +29,9 @@ import org.moqui.impl.service.runner.EntityAutoServiceRunner
 import org.moqui.resource.ResourceReference
 import org.moqui.entity.*
 import org.moqui.impl.context.ArtifactExecutionFacadeImpl
+import org.moqui.impl.context.EntityTxCache
 import org.moqui.impl.context.ExecutionContextFactoryImpl
+import org.moqui.impl.context.TransactionCacheDb
 import org.moqui.impl.context.TransactionFacadeImpl
 import org.moqui.impl.entity.EntityJavaUtil.RelationshipInfo
 import org.moqui.util.CollectionUtilities
@@ -1223,7 +1225,7 @@ class EntityFacadeImpl implements EntityFacade {
         databaseNodeByGroupName.put(groupName, node)
         return node
     }
-    protected MNode getDatabaseNodeByConf(String confName) {
+    MNode getDatabaseNodeByConf(String confName) {
         return ecfi.confXmlRoot.first("database-list")
                 .first({ MNode it -> it.name == 'database' && it.attribute("name") == confName })
     }
@@ -1924,6 +1926,8 @@ class EntityFacadeImpl implements EntityFacade {
             // do nothing, just means seqName is not an entity name
             if (isTraceEnabled) logger.trace("Ignoring exception for entity not found: ${e.toString()}")
         }
+        String overlaySeq = overlayHoldSeq(seqName)
+        if (overlaySeq != null) return overlaySeq
         // fall through to default to the db sequenced ID
         long staggerMaxPrim = staggerMax != null ? staggerMax.longValue() : 0L
         long bankSizePrim = (bankSize != null && bankSize.longValue() > 0) ? bankSize.longValue() : defaultBankSize
@@ -1939,8 +1943,25 @@ class EntityFacadeImpl implements EntityFacade {
             // do nothing, just means seqName is not an entity name
             if (isTraceEnabled) logger.trace("Ignoring exception for entity not found: ${e.toString()}")
         }
+        String overlaySeq = overlayHoldSeq(ed.getFullEntityName())
+        if (overlaySeq != null) return overlaySeq
         // fall through to default to the db sequenced ID
         return dbSequencedIdPrimary(ed.getFullEntityName(), entityInfo.sequencePrimaryStagger, entityInfo.sequenceBankSize)
+    }
+
+    private String overlayHoldSeq(String seqName) {
+        EntityTxCache active = getActiveTxCache()
+        if (!(active instanceof TransactionCacheDb)) return null
+        TransactionCacheDb db = (TransactionCacheDb) active
+        if (!db.isHold() || db.isBypass()) return null
+        if ("moqui.entity.SequenceValueItem".equals(seqName)) return null
+        try {
+            if (isEntityDefined(seqName)) {
+                EntityDefinition seqEd = getEntityDefinition(seqName)
+                if (seqEd != null && !db.handles(seqEd)) return null
+            }
+        } catch (EntityException ignored) { }
+        return db.nextSeq(seqName)
     }
 
     protected final static long defaultBankSize = 50L
@@ -2041,6 +2062,30 @@ class EntityFacadeImpl implements EntityFacade {
         entityGroupName = ed.getEntityGroupName()?.intern()
         entityGroupNameMap.put(entityName, entityGroupName)
         return entityGroupName
+    }
+
+    EntityTxCache getActiveTxCache() {
+        ExecutionContextImpl eci = ecfi.getEci()
+        return eci != null ? eci.entityTxCache : null
+    }
+    @Override
+    void startTxCacheDb(boolean hold) {
+        ExecutionContextImpl eci = ecfi.getEci()
+        if (eci.entityTxCache != null)
+            throw new EntityException("A TX cache is already active on this ExecutionContext")
+        eci.entityTxCache = new TransactionCacheDb(this, hold)
+    }
+    @Override
+    void stopTxCache() {
+        ExecutionContextImpl eci = ecfi.getEci()
+        EntityTxCache cur = eci.entityTxCache
+        eci.entityTxCache = null
+        if (cur != null) cur.close()
+    }
+    @Override
+    boolean isTxCacheActive() {
+        ExecutionContextImpl eci = ecfi.getEci()
+        return eci != null && eci.entityTxCache != null
     }
 
     @Override Connection getConnection(String groupName) { return getConnection(groupName, false) }

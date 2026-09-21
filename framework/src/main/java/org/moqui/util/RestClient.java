@@ -16,7 +16,10 @@ package org.moqui.util;
 import groovy.json.JsonBuilder;
 import groovy.json.JsonSlurperClassic;
 
+import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.UnsupportedEncodingException;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -33,16 +36,20 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 
 import org.eclipse.jetty.client.CompletableResponseListener;
 import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.HttpClient;
+import org.eclipse.jetty.client.InputStreamResponseListener;
 import org.eclipse.jetty.client.HttpClientTransport;
 import org.eclipse.jetty.client.HttpResponseException;
 import org.eclipse.jetty.client.InputStreamRequestContent;
@@ -67,6 +74,9 @@ import org.eclipse.jetty.util.thread.ScheduledExecutorScheduler;
 import org.eclipse.jetty.util.thread.Scheduler;
 
 import org.moqui.BaseException;
+import org.moqui.Moqui;
+import org.moqui.context.ExecutionContext;
+import org.moqui.context.ExecutionContextFactory;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -81,6 +91,8 @@ public class RestClient {
 
     // NOTE: there is no constant on HttpServletResponse for 429; see RFC 6585 for details
     public static final int TOO_MANY = 429;
+    /** Cap for non-2xx RestStream bodies so checkError does not slurp an SSE tape. */
+    private static final int ERROR_BODY_MAX = 256 * 1024;
 
     // NOTE: DELETE doesn't normally support a body, but some APIs use it
     private static final EnumSet<Method> BODY_METHODS = EnumSet.of(Method.GET, Method.PATCH, Method.POST, Method.PUT, Method.DELETE);
@@ -129,6 +141,8 @@ public class RestClient {
     private boolean timeoutRetry = false;
     private RequestFactory overrideRequestFactory = null;
     private boolean isolate = false;
+    private boolean allowInSim = false;
+    private Set<String> redactHeaderNames = null;
 
     public RestClient() { }
 
@@ -289,8 +303,183 @@ public class RestClient {
     /** If true isolate the request from all other requests by using a new HttpClient instance per request (no cookies, keep alive, etc; each request isolated from others) */
     public RestClient isolate(boolean isolate) { this.isolate = isolate; return this; }
 
+    /** LLM provider calls set this so sim can still reach the model. All other RestClient use is refused in sim. */
+    public RestClient allowInSim(boolean allow) { this.allowInSim = allow; return this; }
+
+    private void refuseIfSim() {
+        if (allowInSim) return;
+        ExecutionContextFactory factory = Moqui.getExecutionContextFactory();
+        if (factory == null) return;
+        ExecutionContext ec = factory.getActiveExecutionContext();
+        if (ec != null && ec.isSimSession())
+            throw new BaseException("RestClient is disabled in LLM sim session (" + uriString + ")");
+    }
+
+    /** Names of request headers to mask in TRACE logs (values printed as {@code ***}). Unused unless set. */
+    public RestClient redactHeaders(String... names) {
+        if (names == null || names.length == 0) {
+            this.redactHeaderNames = null;
+            return this;
+        }
+        Set<String> namesLower = new HashSet<>();
+        for (String name : names) {
+            if (name != null && !name.isEmpty()) namesLower.add(name.toLowerCase());
+        }
+        this.redactHeaderNames = namesLower.isEmpty() ? null : namesLower;
+        return this;
+    }
+
+    /** Open the request and return a stream of the response body. Caller must close().
+     *  Does not retry after a 2xx body stream is handed over. 429/timeout retry happens
+     *  only before that, using the same backoff as call(). */
+    public RestStream stream() {
+        refuseIfSim();
+        float curWaitSeconds = initialWaitSeconds;
+        if (curWaitSeconds == 0) curWaitSeconds = 1;
+
+        RestStream curStream = null;
+        for (int i = 0; i <= maxRetries; i++) {
+            try {
+                curStream = streamInternal();
+            } catch (TimeoutException e) {
+                if (timeoutRetry && i < maxRetries) {
+                    try {
+                        Thread.sleep(Math.round(curWaitSeconds * 1000));
+                    } catch (InterruptedException ie) {
+                        logger.warn("RestClient timeout retry sleep interrupted", ie);
+                        Thread.currentThread().interrupt();
+                        throw new BaseException("Timeout error calling REST request", e);
+                    }
+                    curWaitSeconds = curWaitSeconds * initialWaitSeconds;
+                    continue;
+                } else {
+                    throw new BaseException("Timeout error calling REST request", e);
+                }
+            }
+            if (curStream.getStatusCode() == TOO_MANY && i < maxRetries) {
+                curStream.close();
+                try {
+                    Thread.sleep(Math.round(curWaitSeconds * 1000));
+                } catch (InterruptedException e) {
+                    logger.warn("RestClient velocity retry sleep interrupted", e);
+                    Thread.currentThread().interrupt();
+                    throw new BaseException("Retry sleep interrupted for REST request to " + uriString, e);
+                }
+                curWaitSeconds = curWaitSeconds * initialWaitSeconds;
+            } else {
+                break;
+            }
+        }
+
+        return curStream;
+    }
+    protected RestStream streamInternal() throws TimeoutException {
+        if (uriString == null || uriString.isEmpty()) throw new IllegalStateException("No URI set in RestClient");
+        RequestFactory tempFactory = this.isolate ? new SimpleRequestFactory() : null;
+        Request request = null;
+        InputStreamResponseListener listener = null;
+        try {
+            request = makeRequest(tempFactory != null ? tempFactory :
+                    (overrideRequestFactory != null ? overrideRequestFactory : getDefaultRequestFactory()));
+            if (timeoutSeconds < 2) timeoutSeconds = 2;
+            request.idleTimeout(timeoutSeconds - 1, TimeUnit.SECONDS);
+            listener = new InputStreamResponseListener();
+            request.send(listener);
+            Response response = listener.get(timeoutSeconds, TimeUnit.SECONDS);
+            RestStreamImpl stream = new RestStreamImpl(this, request, response, listener, tempFactory);
+            tempFactory = null;
+            return stream;
+        } catch (TimeoutException e) {
+            logger.warn("RestClient request timed out after " + timeoutSeconds + "s waiting for headers from " + uriString);
+            if (request != null) request.abort(e);
+            closeQuietly(listener);
+            if (tempFactory != null) tempFactory.destroy();
+            throw e;
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            if (request != null) request.abort(e);
+            closeQuietly(listener);
+            if (tempFactory != null) tempFactory.destroy();
+            if (e instanceof BaseException) throw (BaseException) e;
+            throw new BaseException("Error calling HTTP request to " + uriString, e);
+        }
+    }
+
+    /** Parse text/event-stream. Blocks the caller thread, invoking consumer per event. */
+    public void streamSse(SseConsumer consumer) {
+        streamSse(consumer, null);
+    }
+    /** Like {@link #streamSse(SseConsumer)} but exposes the RestStream as soon as headers arrive so
+     *  a disconnect/cancel path can {@link RestStream#close()} (Request.abort) from another thread. */
+    public void streamSse(SseConsumer consumer, Consumer<RestStream> onOpen) {
+        if (consumer == null) throw new IllegalArgumentException("SseConsumer is required");
+        RestStream restStream = null;
+        try {
+            restStream = stream();
+            if (onOpen != null) onOpen.accept(restStream);
+            restStream.checkError();
+            BufferedReader reader = restStream.reader();
+            String event = null;
+            String id = null;
+            StringBuilder data = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.isEmpty()) {
+                    if (!dispatchSseEvent(consumer, event, data, id)) return;
+                    event = null;
+                    data.setLength(0);
+                } else if (line.charAt(0) != ':') {
+                    int colon = line.indexOf(':');
+                    String field;
+                    String value;
+                    if (colon < 0) {
+                        field = line;
+                        value = "";
+                    } else {
+                        field = line.substring(0, colon);
+                        value = line.substring(colon + 1);
+                        if (value.startsWith(" ")) value = value.substring(1);
+                    }
+                    if ("event".equals(field)) {
+                        event = value;
+                    } else if ("data".equals(field)) {
+                        data.append(value).append('\n');
+                    } else if ("id".equals(field)) {
+                        id = value;
+                    }
+                }
+            }
+            if (data.length() > 0) {
+                if (!dispatchSseEvent(consumer, event, data, id)) return;
+            }
+            consumer.onComplete();
+        } catch (Throwable t) {
+            consumer.onFailure(t);
+        } finally {
+            if (restStream != null) restStream.close();
+        }
+    }
+    /** @return false when the caller should stop reading (abort or [DONE]) */
+    private static boolean dispatchSseEvent(SseConsumer consumer, String event, StringBuilder data, String id) {
+        if (data.length() == 0) return true;
+        String dataStr = data.toString();
+        if (dataStr.endsWith("\n")) dataStr = dataStr.substring(0, dataStr.length() - 1);
+        if ("[DONE]".equals(dataStr)) {
+            consumer.onComplete();
+            return false;
+        }
+        return consumer.onEvent(event, dataStr, id);
+    }
+
+    private static void closeQuietly(InputStreamResponseListener listener) {
+        if (listener == null) return;
+        try { listener.close(); }
+        catch (IOException e) { logger.warn("Error closing InputStreamResponseListener", e); }
+    }
+
     /** Do the HTTP request and get the response */
     public RestResponse call() {
+        refuseIfSim();
         float curWaitSeconds = initialWaitSeconds;
         if (curWaitSeconds == 0) curWaitSeconds = 1;
 
@@ -387,13 +576,32 @@ public class RestClient {
         request.accept(acceptContentType != null && !acceptContentType.isEmpty() ? acceptContentType : contentType);
 
         if (logger.isTraceEnabled())
-            logger.trace("RestClient request " + request.getMethod() + " " + request.getURI() + " Headers: " + request.getHeaders());
+            logger.trace("RestClient request " + request.getMethod() + " " + request.getURI() + " Headers: " + formatHeadersForLog(request.getHeaders()));
 
         return request;
     }
 
+    private String formatHeadersForLog(HttpFields headers) {
+        if (headers == null) return "";
+        if (redactHeaderNames == null || redactHeaderNames.isEmpty()) return headers.toString();
+        StringBuilder sb = new StringBuilder();
+        sb.append('[');
+        boolean first = true;
+        for (HttpField hdr : headers) {
+            if (!first) sb.append(", ");
+            first = false;
+            String name = hdr.getName();
+            sb.append(name).append('=');
+            if (redactHeaderNames.contains(name.toLowerCase())) sb.append("***");
+            else sb.append(hdr.getValue());
+        }
+        sb.append(']');
+        return sb.toString();
+    }
+
     /** Call in background  */
     public Future<RestResponse> callFuture() {
+        refuseIfSim();
         if (uriString == null || uriString.isEmpty()) throw new IllegalStateException("No URI set in RestClient");
         return new RestClientFuture(this);
     }
@@ -490,6 +698,136 @@ public class RestClient {
                 return new String(bytes, 3, bytes.length - 3, StandardCharsets.UTF_8);
             } else {
                 return new String(bytes, StandardCharsets.UTF_8);
+            }
+        }
+    }
+
+    public interface RestStream extends AutoCloseable {
+        int getStatusCode();
+        String getReasonPhrase();
+        String getContentType();
+        Map<String, ArrayList<String>> headers();
+        InputStream getInputStream();
+        /** UTF-8 default */
+        BufferedReader reader();
+        RestClient getClient();
+        /** If status code is not in the 200 range, read the error body and throw {@link HttpErrorException}. */
+        RestStream checkError();
+        /** Idempotent. Stops the in-flight request and releases the response body. */
+        @Override void close();
+    }
+
+    /** Non-2xx stream response; body is included so callers can classify JSON errors. */
+    public static class HttpErrorException extends HttpResponseException {
+        private final int statusCode;
+        private final String responseText;
+        public HttpErrorException(String message, Response response, String responseText) {
+            super(message, response);
+            this.statusCode = response != null ? response.getStatus() : 0;
+            this.responseText = responseText != null ? responseText : "";
+        }
+        public int getStatusCode() { return statusCode; }
+        public String getResponseText() { return responseText; }
+    }
+
+    public interface SseConsumer {
+        /** Return false to stop reading.
+         *  event may be null (SSE spec default). data is concatenated multi-line data. */
+        boolean onEvent(String event, String data, String id);
+        default void onComplete() {}
+        default void onFailure(Throwable t) { throw new BaseException("SSE stream failed", t); }
+    }
+
+    public static class RestStreamImpl implements RestStream {
+        private final RestClient rci;
+        private final Request request;
+        private final Response response;
+        private final InputStreamResponseListener listener;
+        private RequestFactory tempFactory;
+        private final InputStream inputStream;
+        private BufferedReader reader;
+        private final Map<String, ArrayList<String>> headers = new LinkedHashMap<>();
+        private final int statusCode;
+        private final String reasonPhrase, contentType;
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+
+        RestStreamImpl(RestClient rci, Request request, Response response, InputStreamResponseListener listener,
+                RequestFactory tempFactory) {
+            this.rci = rci;
+            this.request = request;
+            this.response = response;
+            this.listener = listener;
+            this.tempFactory = tempFactory;
+            this.inputStream = listener.getInputStream();
+            this.statusCode = response.getStatus();
+            this.reasonPhrase = response.getReason();
+            String ct = response.getHeaders() != null ? response.getHeaders().get(HttpHeader.CONTENT_TYPE) : null;
+            if (ct != null) {
+                int semi = ct.indexOf(';');
+                this.contentType = (semi > 0 ? ct.substring(0, semi) : ct).trim();
+            } else {
+                this.contentType = null;
+            }
+            for (HttpField hdr : response.getHeaders()) {
+                String name = hdr.getName();
+                ArrayList<String> curList = headers.get(name);
+                if (curList == null) {
+                    curList = new ArrayList<>();
+                    headers.put(name, curList);
+                }
+                curList.addAll(Arrays.asList(hdr.getValues()));
+            }
+        }
+
+        @Override public RestStream checkError() {
+            if (statusCode < 200 || statusCode >= 300) {
+                String body = readErrorBody();
+                logger.info("Error " + statusCode + " (" + reasonPhrase + ") in response to " + rci.method
+                        + " to " + rci.uriString + (body.isEmpty() ? "" : ", response text:\n" + body));
+                throw new HttpErrorException("Error " + statusCode + " (" + reasonPhrase + ") in response to "
+                        + rci.method + " to " + rci.uriString, response, body);
+            }
+            return this;
+        }
+
+        private String readErrorBody() {
+            try {
+                BufferedReader r = reader();
+                StringBuilder sb = new StringBuilder();
+                char[] buf = new char[2048];
+                int n;
+                while ((n = r.read(buf)) >= 0) {
+                    int room = ERROR_BODY_MAX - sb.length();
+                    if (room <= 0) break;
+                    sb.append(buf, 0, Math.min(n, room));
+                }
+                return sb.toString();
+            } catch (IOException e) {
+                logger.warn("Error reading REST error response body from " + rci.uriString, e);
+                return "";
+            }
+        }
+
+        @Override public RestClient getClient() { return rci; }
+        @Override public int getStatusCode() { return statusCode; }
+        @Override public String getReasonPhrase() { return reasonPhrase; }
+        @Override public String getContentType() { return contentType; }
+        @Override public Map<String, ArrayList<String>> headers() { return headers; }
+        @Override public InputStream getInputStream() { return inputStream; }
+        @Override public BufferedReader reader() {
+            if (reader == null) reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8));
+            return reader;
+        }
+
+        @Override public void close() {
+            if (!closed.compareAndSet(false, true)) return;
+            try { listener.close(); }
+            catch (IOException e) { logger.warn("Error closing RestStream listener", e); }
+            try { request.abort(new CancellationException("RestStream closed")); }
+            catch (Exception e) { logger.warn("Error aborting RestStream request", e); }
+            if (tempFactory != null) {
+                tempFactory.destroy();
+                tempFactory = null;
             }
         }
     }

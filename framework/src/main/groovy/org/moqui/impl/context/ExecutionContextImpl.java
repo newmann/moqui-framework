@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 
 import javax.annotation.Nonnull;
@@ -40,6 +41,7 @@ import org.moqui.screen.ScreenFacade;
 import org.moqui.service.ServiceFacade;
 import org.moqui.util.ContextBinding;
 import org.moqui.util.ContextStack;
+import org.moqui.llm.a2a.A2AFacade;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,6 +55,12 @@ public class ExecutionContextImpl implements ExecutionContext {
     public final ContextBinding contextBindingInternal = new ContextBinding(contextStack);
 
     private EntityFacadeImpl activeEntityFacade;
+    /** Thread-local entity overlay (TransactionCacheDb); not the JTA TransactionCache. */
+    public EntityTxCache entityTxCache = null;
+    /** When true, side-effect fence is on (email/HTTP/async suppressed). Usually paired with HOLD overlay. */
+    public boolean simSession = false;
+
+    @Override public boolean isSimSession() { return simSession; }
 
     private WebFacade webFacade = (WebFacade) null;
     private WebFacadeImpl webFacadeImpl = (WebFacadeImpl) null;
@@ -147,6 +155,8 @@ public class ExecutionContextImpl implements ExecutionContext {
     public @Nonnull EntityFacadeImpl getEntityFacade() { return activeEntityFacade; }
 
     @Override public @Nonnull ElasticFacade getElastic() { return ecfi.elasticFacade; }
+    @Override public @Nonnull LlmFacade getLlm() { return ecfi.llmFacade; }
+    @Override public @Nonnull A2AFacade getA2A() { return ecfi.a2aFacade; }
     @Override public @Nonnull ServiceFacade getService() { return serviceFacade; }
     @Override public @Nonnull ScreenFacade getScreen() { return screenFacade; }
 
@@ -198,9 +208,21 @@ public class ExecutionContextImpl implements ExecutionContext {
 
     /** Meant to be used to set a test stub that implements the WebFacade interface */
     public void setWebFacade(WebFacade wf) {
+        if (wf == null) {
+            clearWebFacade();
+            return;
+        }
         webFacade = wf;
-        if (wf instanceof WebFacadeImpl) webFacadeImpl = (WebFacadeImpl) wf;
-        contextStack.putAll(webFacade.getRequestParameters());
+        // Nested RequestTool uses WebFacadeStub; do not leave a previous WebFacadeImpl visible via getWebImpl().
+        webFacadeImpl = (wf instanceof WebFacadeImpl) ? (WebFacadeImpl) wf : null;
+        java.util.Map<String, Object> parms = wf.getRequestParameters();
+        if (parms != null) contextStack.putAll(parms);
+    }
+
+    /** Drop the current WebFacade (used by RequestTool when there was no previous facade). */
+    public void clearWebFacade() {
+        webFacade = null;
+        webFacadeImpl = null;
     }
 
     public boolean getSkipStats() {
@@ -214,6 +236,10 @@ public class ExecutionContextImpl implements ExecutionContext {
 
     @Override
     public Future runAsync(@Nonnull Closure closure) {
+        if (simSession) {
+            loggerDirect.info("Skipping runAsync in LLM sim session");
+            return CompletableFuture.completedFuture(null);
+        }
         ThreadPoolRunnable runnable = new ThreadPoolRunnable(this, closure);
         return ecfi.workerPool.submit(runnable);
     }
@@ -228,6 +254,11 @@ public class ExecutionContextImpl implements ExecutionContext {
         // if webFacade exists this is the end of a request, so trigger after-request actions
         if (webFacadeImpl != null) webFacadeImpl.runAfterRequestActions();
 
+        if (entityTxCache != null) {
+            try { entityTxCache.close(); }
+            catch (Throwable t) { loggerDirect.warn("Error closing entity TX cache on destroy", t); }
+            entityTxCache = null;
+        }
         // make sure there are no transactions open, if any commit them all now
         ecfi.transactionFacade.destroyAllInThread();
         // clean up resources, like JCR session
