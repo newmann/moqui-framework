@@ -1,7 +1,7 @@
 # AGENTS — {component-name}
 
-Scoped rules for this component. This file overrides the repository root
-`AGENTS.md` when you are working in this directory.
+Domain rules for this component. Supplements root [AGENTS.md](../../AGENTS.md)
+and shared [.agents/component-common.md](../../.agents/component-common.md).
 
 ## Role
 
@@ -23,34 +23,11 @@ Depends on (from `component.xml`):
 
 ## Conventions
 
-- Default `userGroupId` for new authz: `ADMIN` unless this app defines another
-- Do not redefine mantle entities; extend with `<extend-entity>`,
-  view-entity, SECA/EECA, or this component's own package
-- New services stay under this component's service path
-- Mount screens from this component's `MoquiConf.xml`
-- UI original text stays English; Chinese only in `data/{Prefix}L10nData.xml`
-- User-facing service errors call `ec.l10n.localize` (or `ec.resource.expand`) first
+Component-specific rules only (authz groups, domain invariants, phase order).
+Shared mount/l10n/authz/verify rules: `.agents/component-common.md`.
 
 ## Verify
 
-After changes, use one of these (adjust names):
-
-```bash
-curl -s -X POST -H "Content-Type: application/json" \
-  -u john.doe:moqui \
-  -d '{"serviceName": "{path.Services.verb#Noun}"}' \
-  http://localhost:8080/apps/tools/Service/ServiceRun/runJson
-```
-
-- Screen: `http://localhost:8080/qapps/{subscreens-item-name}/`
-  (also `/qapps2/{subscreens-item-name}/`)
-- REST: `http://localhost:8080/rest/s1/{resourceName}/`
-
-## Do not
-
-- Edit entities, services, or screens in a dependency or catalog
-  component (`mantle-udm`, `mantle-usl`, `SimpleScreens`, `MarbleERP`,
-  `webroot`). Use `<extend-entity>`, SECA/EECA, or this component's
-  `MoquiConf.xml` instead
-- Mount screens by editing `webroot` files; use this component's `MoquiConf.xml`
-- Skip seed ArtifactAuthz for a new app root screen or REST root path
+- ServiceRun: `{path.Services.verb#Noun}` (see `.agents/dev-loop.md` for curl)
+- Screen: `/qapps/{subscreens-item-name}/`
+- REST: `/rest/s1/{resourceName}/`

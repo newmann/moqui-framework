@@ -17,12 +17,13 @@ Read **only** the reference that matches the files you are changing:
 | `entity/**/*.xml`, `*.eecas.xml` | [references/entity.md](references/entity.md) |
 | `service/**/*.xml` (not REST) | [references/service.md](references/service.md) |
 | `service/*.rest.xml` | [references/service.md](references/service.md) (REST section) |
-| `screen/**/*.xml` | [references/screen.md](references/screen.md) (`qvt`/`qvue`/`qjs`; qapps2 falls back, no `*2` types) |
+| `screen/**/*.xml` | [references/screen.md](references/screen.md) and [references/screen-ui-patterns.md](references/screen-ui-patterns.md) (`qvt`/`qvue`/`qjs`; qapps2 falls back, no `*2` types) |
 | `data/**/*.xml` | [references/data.md](references/data.md) |
 | UI / Status / service copy (en/zh) | [references/l10n.md](references/l10n.md) |
 
 XSDs live in `framework/xsd/`. Prefer existing `mantle-udm` / `mantle-usl`
-artifacts: search `runtime/component/` and `runtime/mantle/` with an
-explicit path; do not search only `framework/` or a remote repo. After
-edits, follow the feedback loop in the root `AGENTS.md` (restart rules,
-ServiceRun `runJson`, `runtime/log/moqui.log`).
+artifacts: search with `path` = `runtime/component` (not workspace root,
+not `runtime/`); do not search only `framework/` or a remote repo. After
+edits, follow the feedback loop in
+[.agents/dev-loop.md](../../dev-loop.md) (restart rules, ServiceRun
+`runJson`, `runtime/log/moqui.log`).

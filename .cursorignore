@@ -1,0 +1,15 @@
+# runtime is a separate checkout (framework .gitignore has /runtime).
+# Instant Grep may ignore these negations; AGENTS.md paths are still required.
+!/runtime
+!/runtime/**
+
+# Generated and local data
+/runtime/log/
+/runtime/db/
+/runtime/sessions/
+/runtime/txlog/
+/runtime/tmp/
+/docker/db/
+/docker/minio/data/
+/docker/opensearch/data/
+/docker/elasticsearch/

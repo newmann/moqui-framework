@@ -60,8 +60,13 @@ Replace `my-app` / `my.app` with the real name. After files exist:
         name="my-app" version="1.0.0">
     <depends-on name="mantle-udm"/>
     <depends-on name="mantle-usl"/>
+    <depends-on name="SimpleScreens"/>
 </component>
 ```
+
+Add `SimpleScreens` when screens reuse party/status/enum templates or
+extend catalog forms. See
+`.agents/skills/moqui-xml-dsls/references/screen-ui-patterns.md`.
 
 Missing deps fail at runtime. Fix with `./gradlew getDepends`.
 
@@ -175,6 +180,12 @@ not duplicate `framework/data/CommonL10nData.xml`. Full rules:
 </screen>
 ```
 
+Before adding Find/Edit screens: read
+`.agents/skills/moqui-xml-dsls/references/screen-ui-patterns.md` (FK
+widgets, inline forms, SimpleScreens includes). Search
+`runtime/component/SimpleScreens` for matching `Edit*.xml` and
+`template/` before writing new forms.
+
 `service/my/app/Services.xml` → `my.app.Services.ping`:
 
 ```xml
@@ -189,13 +200,15 @@ not duplicate `framework/data/CommonL10nData.xml`. Full rules:
 </services>
 ```
 
-Copy `templates/component-AGENTS.md` into the component as `AGENTS.md`
-and fill the placeholders.
+Official/catalog components usually have no `AGENTS.md`; infer from
+`component.xml`, `MoquiConf.xml`, and `data/*SeedData.xml`. For a new
+local component, copy `templates/component-AGENTS.md` into the
+component as `AGENTS.md` and fill the placeholders.
 
 ## Load and verify
 
 1. `./gradlew getDepends`
-2. Stop `moqui.war` (see root `AGENTS.md`)
+2. Stop `moqui.war` (see [.agents/dev-loop.md](../../dev-loop.md))
 3. `./gradlew load` (or `-Ptypes=seed` if only seed changed)
 4. Start the server; wait for 8080 plus ~5 seconds
 5. ServiceRun (works without REST):

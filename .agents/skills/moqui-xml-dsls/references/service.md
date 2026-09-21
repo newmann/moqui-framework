@@ -30,8 +30,8 @@ automatically. Scripts: `type="script" location="component://..."`.
 - `entity-auto` is fine for simple CRUD on one entity (`noun` = entity name).
 - SECA: `service/*.secas.xml`. SECA/EECA changes need a restart; service
   body XML hot-reloads after ~5 seconds.
-- Test with ServiceRun `runJson` (root `AGENTS.md`). Do not require REST
-  first.
+- Test with ServiceRun `runJson` ([.agents/dev-loop.md](../../../dev-loop.md)).
+  Do not require REST first.
 - User-facing `addError` / `addMessage` must call `ec.l10n.localize`
   (or `ec.resource.expand` for `${}` templates). See [l10n.md](l10n.md).
 
