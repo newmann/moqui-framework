@@ -3,6 +3,10 @@
 XSD: `framework/xsd/xml-screen-3.xsd` (forms in `xml-form-3.xsd`).
 Screens hot-reload; **`MoquiConf.xml` mount does not** — restart.
 
+**Generating or editing screens:** also read
+[screen-ui-patterns.md](screen-ui-patterns.md) — FK display names, inline
+`form-single` layout, and SimpleScreens template reuse.
+
 The menu URL is the `subscreens-item@name` on
 `component://webroot/screen/webroot/apps.xml`, not the file name alone.
 Mount from **this component's** `MoquiConf.xml`. Do not edit webroot.
@@ -29,6 +33,34 @@ Subscreen sources (later wins): directory `subscreens/`, screen XML
 <screen default-menu-title="My App"/>
 ```
 
+```xml
+<!-- bad: FK shown as raw id -->
+<field name="statusId"><default-field><display/></default-field></field>
+<!-- good -->
+<field name="statusId"><default-field>
+    <display-entity entity-name="moqui.basic.StatusItem"/>
+</default-field></field>
+```
+
+```xml
+<!-- bad: every sub-form behind container-dialog on an edit page -->
+<container-dialog id="AddItemDialog" button-text="Add Item">
+    <form-single name="AddItemForm" transition="addItem">...</form-single>
+</container-dialog>
+<!-- good: inline form-single above form-list (see screen-ui-patterns.md) -->
+<section name="AddItemSection"><widgets>
+    <form-single name="AddItemForm" transition="addItem">...</form-single>
+</widgets></section>
+```
+
+```xml
+<!-- bad: reimplement party search in local component -->
+<transition name="searchPartyList">...</transition>
+<!-- good -->
+<transition-include name="searchPartyList"
+        location="component://SimpleScreens/template/party/PartyForms.xml"/>
+```
+
 - Screens display and transition. Business work goes through
   `<service-call>` in a transition (or a service it calls), not inline
   in widgets. After a form submit that changes data, redirect.
@@ -53,6 +85,12 @@ Subscreen sources (later wins): directory `subscreens/`, screen XML
   | Plain JS (`define(` / AMD) | `qjs` | `qjs2` (falls back to `qjs`) |
 - Keep `menu-title`, labels, form titles, and button text in English.
   Chinese goes in `data/*L10nData.xml`. See [l10n.md](l10n.md).
+- In custom `qvue`/`qvt`, do not use native HTML date controls
+  (`q-input type="date"`, `type="datetime-local"`, `type="time"`).
+  Those follow the browser/OS UI language, not the Moqui user locale
+  (Chinese Chrome shows 年/月/日, 清除, 今天 even for English users).
+  Use `m-date-time` (`name` required; `type="date"` or `type="date-time"`).
+  In form XML use `<date-find>` / `<date-time>`.
 - Put `icon` on common action `<submit>`, `<link>`, and
   `container-dialog` / `dynamic-dialog`. Theme fallback matches the
   **localized** button text, so Chinese titles get no icon unless
