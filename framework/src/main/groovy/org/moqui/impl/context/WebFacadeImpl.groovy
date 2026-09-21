@@ -1110,7 +1110,11 @@ class WebFacadeImpl implements WebFacade {
                 } else {
                     // NOTE: This will always respond with 200 OK, consider using 201 Created (for successful POST, create PUT)
                     //     and 204 No Content (for DELETE and other when no content is returned)
-                    sendJsonResponse(restResult.responseObj)
+                    if (response.isCommitted()) {
+                        // service already wrote the body (sendResourceResponse, sendError, etc.)
+                    } else {
+                        sendJsonResponse(restResult.responseObj)
+                    }
                 }
             }
         } catch (AuthenticationRequiredException e) {
