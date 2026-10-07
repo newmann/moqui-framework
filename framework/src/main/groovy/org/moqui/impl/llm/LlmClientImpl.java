@@ -284,7 +284,7 @@ public class LlmClientImpl implements LlmClient {
             List<LlmMessage> window = buildWindow();
             ProtocolRequest req = buildRequest(model, window);
             req.stream = true;
-            req.onStreamOpen = this::registerInFlight;
+            bindUpstreamOpen(req, listener);
             ProtocolResult[] resultBox = new ProtocolResult[1];
             Throwable[] failBox = new Throwable[1];
             LlmTrace.logRequest(this, req);
@@ -330,6 +330,10 @@ public class LlmClientImpl implements LlmClient {
             LlmFinishReason fr = result.finishReason != null ? result.finishReason : LlmFinishReason.ERROR;
             if (fr == LlmFinishReason.STOP || fr == LlmFinishReason.LENGTH || fr == LlmFinishReason.TOOL_CALLS) {
                 persistSuccess(window, result, fr, start);
+                LlmResponse streamed = finishStreamResult(listener, result, start);
+                try { ConversationSummary.maybe(this); }
+                catch (Throwable t) { logger.warn("Conversation summary failed: " + t.getMessage()); }
+                return streamed;
             }
             return finishStreamResult(listener, result, start);
         } catch (Throwable t) {
@@ -356,6 +360,12 @@ public class LlmClientImpl implements LlmClient {
                 try { conversation.repairTerminalIfStreaming(cancelled); }
                 catch (Throwable persistErr) {
                     logger.error("Error repairing LLM Streaming status for conversation " + convId(), persistErr);
+                }
+            }
+            if (conversation != null) {
+                try { conversation.releaseTurnClaim(); }
+                catch (Throwable persistErr) {
+                    logger.error("Error releasing LLM turn for conversation " + convId(), persistErr);
                 }
             }
             if (aefi != null && aei != null) aefi.pop(aei);
@@ -435,7 +445,10 @@ public class LlmClientImpl implements LlmClient {
 
                 if (fr == LlmFinishReason.STOP || fr == LlmFinishReason.LENGTH || fr == LlmFinishReason.TOOL_CALLS) {
                     persistSuccess(window, result, fr, start);
-                    return toResponse(result, fr, start);
+                    LlmResponse done = toResponse(result, fr, start);
+                    try { ConversationSummary.maybe(this); }
+                    catch (Throwable t) { logger.warn("Conversation summary failed: " + t.getMessage()); }
+                    return done;
                 }
                 if (fr == LlmFinishReason.CONTENT_FILTER) {
                     throw new LlmException(nvl(result.errorMessage, "LLM content filter"),
@@ -489,6 +502,12 @@ public class LlmClientImpl implements LlmClient {
                 try { conversation.repairTerminalIfStreaming(cancelled); }
                 catch (Throwable persistErr) {
                     logger.error("Error repairing LLM Streaming status for conversation " + convId(), persistErr);
+                }
+            }
+            if (conversation != null) {
+                try { conversation.releaseTurnClaim(); }
+                catch (Throwable persistErr) {
+                    logger.error("Error releasing LLM turn for conversation " + convId(), persistErr);
                 }
             }
             if (aefi != null && aei != null) aefi.pop(aei);
@@ -695,6 +714,13 @@ public class LlmClientImpl implements LlmClient {
         if (isExternallyCancelled()) throw new CancellationException("LLM conversation cancelled");
     }
 
+    /** Track the provider stream and tell the listener once its response headers arrive. */
+    void bindUpstreamOpen(ProtocolRequest req, LlmStreamListener listener) {
+        req.onStreamOpen = stream -> {
+            registerInFlight(stream);
+            if (listener != null) listener.onUpstreamOpen();
+        };
+    }
     void registerInFlight(RestClient.RestStream stream) {
         this.activeStream = stream;
         LlmFacadeImpl f = facadeOrNull();
@@ -729,16 +755,18 @@ public class LlmClientImpl implements LlmClient {
         return DEFAULT_MAX_ITERATIONS;
     }
 
-    /** Nested sim agent: same profile/protocol and parent tools except write_ui / enter_sim / find_skill. */
+    /** Nested sim agent: same profile/protocol and parent tools except write_ui / enter_sim / find_skill / pin. */
     LlmClientImpl nestForSim(int maxIter) {
         LlmClientImpl nested = new LlmClientImpl(ec, profile, transactionInPlace);
         nested.maxIterations(maxIter > 0 ? maxIter : 32);
+        nested.activeSkillName = activeSkillName;
         nested.allowedPaths.addAll(allowedPaths);
         nested.allowedEntities.addAll(allowedEntities);
         for (LlmTool t : tools) {
             if (t == null) continue;
             String n = t.getName();
-            if (WriteUiTool.NAME.equals(n) || EnterSimTool.NAME.equals(n) || FindSkillTool.NAME.equals(n)) continue;
+            if (WriteUiTool.NAME.equals(n) || EnterSimTool.NAME.equals(n) || FindSkillTool.NAME.equals(n)
+                    || PinTool.NAME.equals(n)) continue;
             if (t instanceof RequestTool) {
                 boolean unprefixed = profile != null && profile.allowUnprefixedRequest;
                 LlmTool rt = LlmGateway.requestToolForServlet(allowedPaths, unprefixed);
@@ -759,33 +787,7 @@ public class LlmClientImpl implements LlmClient {
     }
 
     Object truncateResult(Object result) {
-        if (result == null) return null;
-        String json = result instanceof String ? (String) result : LlmJson.toJson(result);
-        if (json == null || json.length() <= toolResultMaxChars) return result;
-        Map<String, Object> truncated = new LinkedHashMap<>();
-        truncated.put("truncated", true);
-        truncated.put("size", json.length());
-        if (result instanceof Map) {
-            Map<?, ?> m = (Map<?, ?>) result;
-            copyTruncationKey(truncated, m, "error");
-            copyTruncationKey(truncated, m, "instruction");
-            copyTruncationKey(truncated, m, "hint");
-            copyTruncationKey(truncated, m, "select");
-            copyTruncationKey(truncated, m, "proposedSkillName");
-            copyTruncationKey(truncated, m, "proposedSkillId");
-            copyTruncationKey(truncated, m, "proposedSkillStatus");
-            copyTruncationKey(truncated, m, "selected");
-            copyTruncationKey(truncated, m, "simActive");
-            copyTruncationKey(truncated, m, "sim");
-            copyTruncationKey(truncated, m, "status");
-            copyTruncationKey(truncated, m, "ok");
-        }
-        truncated.put("preview", json.substring(0, toolResultMaxChars));
-        return truncated;
-    }
-
-    private static void copyTruncationKey(Map<String, Object> dest, Map<?, ?> src, String key) {
-        if (src.containsKey(key) && src.get(key) != null) dest.put(key, src.get(key));
+        return ToolResultTrim.limit(result, toolResultMaxChars);
     }
 
     private void applyAllowLists(LlmTool tool) {

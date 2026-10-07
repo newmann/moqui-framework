@@ -55,7 +55,7 @@ public final class LlmGateway {
     private LlmGateway() { }
 
     public static final class Route {
-        public enum Op { CHAT, RESUME, CANCEL, GET_CONVERSATION, LIST_CONVERSATIONS, GET_PROFILES }
+        public enum Op { CHAT, RESUME, CANCEL, GET_CONVERSATION, LIST_CONVERSATIONS, GET_PROFILES, DELETE_CONVERSATION }
         public final Op op;
         public final String conversationId;
         public Route(Op op, String conversationId) {
@@ -68,13 +68,16 @@ public final class LlmGateway {
         public boolean isGet() {
             return op == Op.GET_CONVERSATION || op == Op.LIST_CONVERSATIONS || op == Op.GET_PROFILES;
         }
+        public boolean isDelete() { return op == Op.DELETE_CONVERSATION; }
     }
 
     /**
      * Parse the extra path after the /llm servlet mapping. Requires the v1 prefix.
      * Accepts POST /v1/conversations/{id}/cancel as an alias of /v1/chat/{id}/cancel.
      */
-    public static Route parseRoute(String pathInfo) {
+    public static Route parseRoute(String pathInfo) { return parseRoute(pathInfo, null); }
+
+    public static Route parseRoute(String pathInfo, String method) {
         if (pathInfo == null) pathInfo = "";
         while (pathInfo.startsWith("/")) pathInfo = pathInfo.substring(1);
         if (pathInfo.endsWith("/") && pathInfo.length() > 1)
@@ -91,7 +94,11 @@ public final class LlmGateway {
         }
         if ("conversations".equals(p[1])) {
             if (p.length == 2) return new Route(Route.Op.LIST_CONVERSATIONS, null);
-            if (p.length == 3) return new Route(Route.Op.GET_CONVERSATION, p[2]);
+            if (p.length == 3) {
+                if (method != null && "DELETE".equalsIgnoreCase(method))
+                    return new Route(Route.Op.DELETE_CONVERSATION, p[2]);
+                return new Route(Route.Op.GET_CONVERSATION, p[2]);
+            }
             if (p.length == 4 && "cancel".equals(p[3])) return new Route(Route.Op.CANCEL, p[2]);
             return null;
         }
@@ -142,8 +149,9 @@ public final class LlmGateway {
     }
 
     /**
-     * Request tools may only subset {request, write_ui, browse, run_service}. write-ui is accepted as write_ui.
-     * Unknown names are 400, not silently ignored.
+     * Request tools may only subset {request, write_ui, browse, find_basic, run_service, find_skill, enter_sim, pin}.
+     * write-ui is accepted as write_ui. Unknown names are 400, not silently ignored.
+     * find_basic is a legal name here; attachServletTools adds the tool only when the profile has an allow list.
      */
     public static List<String> parseTools(Object tools) {
         List<String> names = new ArrayList<>();
@@ -157,7 +165,7 @@ public final class LlmGateway {
                 if (o != null && !o.toString().isBlank()) names.add(o.toString().trim());
             }
         } else {
-            throw new LlmException("tools must be a list of request/write_ui/browse/run_service/find_skill/enter_sim",
+            throw new LlmException("tools must be a list of request/write_ui/browse/find_basic/run_service/find_skill/enter_sim/pin",
                     null, LlmFinishReason.ERROR, 400, null, null);
         }
         Set<String> seen = new LinkedHashSet<>();
@@ -165,8 +173,9 @@ public final class LlmGateway {
             String n = "write-ui".equals(raw) ? "write_ui" : raw;
             if ("run-service".equals(n)) n = "run_service";
             if (!"request".equals(n) && !"write_ui".equals(n) && !"browse".equals(n) && !"run_service".equals(n)
-                    && !"find_skill".equals(n) && !"enter_sim".equals(n))
-                throw new LlmException("tools may only subset {request, write_ui, browse, run_service, find_skill, enter_sim}",
+                    && !"find_skill".equals(n) && !"enter_sim".equals(n) && !"pin".equals(n)
+                    && !FindBasicTool.NAME.equals(n))
+                throw new LlmException("tools may only subset {request, write_ui, browse, find_basic, run_service, find_skill, enter_sim, pin}",
                         null, LlmFinishReason.ERROR, 400, null, null);
             seen.add(n);
         }
@@ -200,6 +209,8 @@ public final class LlmGateway {
         boolean wantRunService = tools.contains("run_service");
         boolean wantFindSkill = tools.contains("find_skill") || wantBrowse || wantRunService;
         boolean wantEnterSim = tools.contains("enter_sim");
+        boolean wantPin = tools.contains("pin") || wantFindSkill;
+        boolean wantFindBasic = tools.contains(FindBasicTool.NAME);
         if (wantRequest) {
             boolean unprefixed = profile != null && profile.allowUnprefixedRequest;
             LlmTool rt = requestToolForServlet(profile != null ? profile.allowedPaths : null, unprefixed);
@@ -207,6 +218,7 @@ public final class LlmGateway {
         }
         if (wantWriteUi && profile != null && profile.allowWriteUi) {
             WriteUiTool wt = new WriteUiTool();
+            wt.setAllowVueSfc(profile.allowVueSfc);
             if (profile.allowUnprefixedRequest && (profile.allowedEntities == null || profile.allowedEntities.isEmpty()))
                 wt.setAllowAnyAuthorizedEntity(true);
             client.tool(wt);
@@ -216,6 +228,10 @@ public final class LlmGateway {
         if (wantRunService && profile != null && profile.allowRunService) client.tool(LlmTool.runService());
         if (wantFindSkill) client.tool(LlmTool.findSkill());
         if (wantEnterSim && profile != null && profile.allowEnterSim) client.tool(LlmTool.enterSim());
+        if (wantPin) client.tool(LlmTool.pin());
+        if (wantFindBasic && profile != null && profile.allowedBasicEntities != null
+                && !profile.allowedBasicEntities.isEmpty())
+            client.tool(new FindBasicTool(profile.allowedBasicEntities));
     }
 
     public static void requireLlmGateway(ExecutionContext ec) {
@@ -246,6 +262,13 @@ public final class LlmGateway {
                         null, LlmFinishReason.ERROR, 409, profileName, conversationId);
         } else if (conversationId != null) {
             impl.conversation(conversationId);
+            // A live turn already claimed this id. Refuse before refreshContext deletes its context rows.
+            // A Streaming row with no claim is abandoned; the turn below takes it over.
+            if (LlmConversationImpl.STATUS_STREAMING.equals(impl.conversation.getStatus())
+                    && LlmConversationImpl.turnInFlight(ec, conversationId)) {
+                throw new LlmException("Conversation is LlmcsStreaming (single-flight)",
+                        null, LlmFinishReason.ERROR, 409, profileName, conversationId);
+            }
         } else {
             Map<String, Object> attrs = new LinkedHashMap<>();
             String canvasId = str(body.get("canvasId"));
@@ -268,8 +291,18 @@ public final class LlmGateway {
         }
 
         applyForceSkillUse(impl, body);
+        applyWriteMode(impl, body);
         applySystem(impl, body);
         appendForceSkillUseSystem(impl);
+        String session = SessionFacts.text(impl.ec);
+        String modeNote = writeModeNote(currentWriteMode(impl));
+        if (modeNote != null && !modeNote.isBlank()) {
+            if (session == null || session.isBlank()) session = modeNote;
+            else session = session + "\n" + modeNote;
+        }
+        refreshContext(impl, "session", session);
+        refreshContext(impl, "pins", PinTool.text(impl));
+        refreshContext(impl, "skill-widgets", SkillIndex.activeWidgetText(impl.ec, impl.activeSkillName));
         String user = str(body.get("user"));
         if (user != null) {
             impl.user(user);
@@ -281,7 +314,7 @@ public final class LlmGateway {
             List<LlmMessage> extra = new ArrayList<>();
             for (Object o : (List<?>) msgs) {
                 LlmMessage parsed = toMessage(o);
-                if (parsed != null) extra.add(parsed);
+                if (parsed != null && parsed.role == LlmMessage.Role.USER) extra.add(parsed);
             }
             if (!extra.isEmpty()) impl.messages(extra);
         }
@@ -327,6 +360,38 @@ public final class LlmGateway {
         }
     }
 
+    static void applyWriteMode(LlmClientImpl impl, Map<String, Object> body) {
+        if (impl == null || impl.conversation == null || body == null || !body.containsKey("writeMode")) return;
+        String mode = canonicalWriteMode(body.get("writeMode"));
+        if (mode != null) impl.conversation.setAttribute("writeMode", mode);
+    }
+    static String currentWriteMode(LlmClientImpl impl) {
+        if (impl == null || impl.conversation == null) return null;
+        return canonicalWriteMode(impl.conversation.getAttributes().get("writeMode"));
+    }
+    static String canonicalWriteMode(Object raw) {
+        if (raw == null) return null;
+        String s = raw.toString().trim();
+        if ("script".equalsIgnoreCase(s)) return "script";
+        if ("agent".equalsIgnoreCase(s)) return "agent";
+        return null;
+    }
+    /** One session-context block naming the Assist write mode that is active for this turn. */
+    static String writeModeNote(String mode) {
+        if ("script".equals(mode)) {
+            return "writeMode=script\n"
+                    + "Script mode is active. Put the POST on the canvas: kind=openui Button "
+                    + "@Run(Mutation(\"request\", {method, path, body})), or kind=form actions with method and path. "
+                    + "A form with only submitLabel returns the values after the click; then request the write. Prefer the Mutation.";
+        }
+        if ("agent".equals(mode)) {
+            return "writeMode=agent\n"
+                    + "Agent mode is active. A submitLabel form is enough. After submitted:true, request or run_service the write. "
+                    + "For risk=confirm, wait for the click.";
+        }
+        return "";
+    }
+
     static void appendForceSkillUseSystem(LlmClientImpl impl) {
         if (impl == null || !impl.forceSkillUse) return;
         String extra = SkillUseGate.SYSTEM_ADDENDUM;
@@ -341,7 +406,15 @@ public final class LlmGateway {
     static void applySystem(LlmClientImpl impl, Map<String, Object> body) {
         LlmFacadeImpl.ProfileState profile = impl != null ? impl.profile : null;
         if (profile != null && profile.systemLocation != null && !profile.systemLocation.isBlank()) {
-            String text = renderPrompt(impl.ec, profile.systemLocation, null);
+            Map<String, Object> promptCtx = new LinkedHashMap<>();
+            promptCtx.put("allowVueSfc", profile.allowVueSfc);
+            try {
+                String hints = ScreenSearchHints.text(impl.ec);
+                if (hints != null && !hints.isBlank()) promptCtx.put("searchHints", hints);
+            } catch (Throwable t) {
+                logger.warn("Search screen hints failed: {}", t.getMessage());
+            }
+            String text = renderPrompt(impl.ec, profile.systemLocation, promptCtx);
             if (text != null && !text.isBlank()) impl.system(text);
             return;
         }
@@ -351,11 +424,21 @@ public final class LlmGateway {
         if (system != null) impl.system(system);
     }
 
+    /** Replace a named context block so a resumed turn does not stack copies. */
+    static void refreshContext(LlmClientImpl impl, String source, String content) {
+        if (impl == null || source == null) return;
+        try {
+            if (impl.conversation != null) impl.conversation.removeContextBySource(source);
+            if (content != null && !content.isBlank()) impl.injectContext(source, content);
+        } catch (Throwable t) {
+            logger.warn("Context {} failed: {}", source, t.getMessage());
+        }
+    }
+
     static void injectSkills(LlmClientImpl impl, String userText) {
         if (impl == null || userText == null || userText.isBlank()) return;
         try {
-            List<SkillIndex.SkillDoc> docs = SkillIndex.retrieve(impl.ec, userText, 3);
-            impl.injectContext("skills", SkillIndex.formatInject(impl.ec, docs));
+            impl.injectContext("skills", SkillIndex.formatInjectForQuery(impl.ec, userText));
         } catch (Throwable t) {
             logger.warn("Skill inject failed: {}", t.getMessage());
         }
@@ -446,13 +529,18 @@ public final class LlmGateway {
 
     public static Map<String, Object> getConversationMap(ExecutionContext ec, String conversationId) {
         requireLlmGateway(ec);
-        LlmConversation conv = LlmConversationImpl.load(ec, conversationId, true);
+        LlmConversationImpl conv = LlmConversationImpl.load(ec, conversationId, true);
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("conversationId", conv.getConversationId());
         out.put("profileName", conv.getProfileName());
         out.put("userId", conv.getUserId());
         out.put("status", conv.getStatus());
         out.put("title", conv.getTitle());
+        out.put("summary", conv.getSummary());
+        out.put("createdDate", millis(conv.getCreatedDate()));
+        out.put("lastMessageDate", millis(conv.getLastMessageDate()));
+        out.put("hasCanvas", conv.hasCanvas());
+        out.put("canvas", conv.getCanvasMap());
         List<Map<String, Object>> hist = new ArrayList<>();
         for (LlmMessage m : conv.getHistory()) hist.add(messageToMap(m));
         out.put("history", hist);
@@ -461,46 +549,185 @@ public final class LlmGateway {
         return out;
     }
 
+    public static final int CONVERSATION_PAGE_SIZE = 20;
+
     /**
-     * Owner's conversations, newest first. ADMIN may list all. Optional profile and purpose (attributes.purpose).
+     * Owner's conversations, newest first. ADMIN may list all.
+     * purpose matches the purpose column. search matches searchText (text-fts), summary, and title.
      */
-    public static List<Map<String, Object>> listConversations(ExecutionContext ec, String profile, String purpose) {
+    public static Map<String, Object> listConversations(ExecutionContext ec, String profile, String purpose,
+            String search, int pageIndex) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        List<Map<String, Object>> rows = new ArrayList<>();
+        out.put("conversations", rows);
+        out.put("pageSize", CONVERSATION_PAGE_SIZE);
+        int page = Math.max(pageIndex, 0);
+        out.put("pageIndex", page);
+        out.put("totalCount", 0L);
         requireLlmGateway(ec);
-        List<Map<String, Object>> out = new ArrayList<>();
         if (ec == null || ec.getEntity() == null || ec.getUser() == null) return out;
         String userId = ec.getUser().getUserId();
         boolean admin = ec.getUser().isInGroup("ADMIN");
+        if (!admin && (userId == null || userId.isBlank())) {
+            out.put("pageIndex", 0);
+            return out;
+        }
         boolean authzWasDisabled = ec.getArtifactExecution().disableAuthz();
-        org.moqui.entity.EntityList list;
         try {
-            org.moqui.entity.EntityFind find = ec.getEntity().find("moqui.llm.LlmConversation")
-                    .orderBy("-lastMessageDate").limit(50);
-            if (!admin) find.condition("userId", userId);
-            if (profile != null && !profile.isBlank()) find.condition("profileName", profile.trim());
-            list = find.list();
+            backfillConversationList(ec, userId, admin, profile);
+            org.moqui.entity.EntityFind find = conversationFind(ec, userId, admin, profile, purpose, search);
+            long total = find.count();
+            int lastPage = total <= 0 ? 0 : (int) ((total - 1) / CONVERSATION_PAGE_SIZE);
+            if (page > lastPage) page = lastPage;
+            out.put("pageIndex", page);
+            out.put("totalCount", total);
+            org.moqui.entity.EntityList list = find.orderBy("-lastMessageDate,-createdDate")
+                    .offset(page, CONVERSATION_PAGE_SIZE).limit(CONVERSATION_PAGE_SIZE)
+                    .selectField("conversationId").selectField("profileName").selectField("userId")
+                    .selectField("statusId").selectField("title").selectField("summary")
+                    .selectField("createdDate").selectField("lastMessageDate").selectField("messageCount")
+                    .selectField("hasCanvas").list();
+            if (list == null) return out;
+            for (org.moqui.entity.EntityValue ev : list) {
+                if (ev == null) continue;
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("conversationId", ev.getString("conversationId"));
+                row.put("profileName", ev.getString("profileName"));
+                row.put("userId", ev.getString("userId"));
+                row.put("status", ev.getString("statusId"));
+                row.put("title", ev.getString("title"));
+                row.put("summary", ev.getString("summary"));
+                row.put("createdDate", millis(ev.getTimestamp("createdDate")));
+                row.put("lastMessageDate", millis(ev.getTimestamp("lastMessageDate")));
+                row.put("messageCount", ev.get("messageCount"));
+                row.put("hasCanvas", "Y".equals(ev.getString("hasCanvas")));
+                rows.add(row);
+            }
         } finally {
             if (!authzWasDisabled) ec.getArtifactExecution().enableAuthz();
         }
-        if (list == null) return out;
+        return out;
+    }
+
+    /** 409 while Streaming. Otherwise delete the conversation and its messages, call logs, and skill uses. */
+    public static Map<String, Object> deleteConversation(ExecutionContext ec, String conversationId) {
+        requireLlmGateway(ec);
+        LlmConversationImpl conv = LlmConversationImpl.load(ec, conversationId, true);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("conversationId", conv.getConversationId());
+        if (LlmConversationImpl.STATUS_STREAMING.equals(conv.getStatus())) {
+            out.put("httpStatus", 409);
+            out.put("deleted", Boolean.FALSE);
+            out.put("message", "Conversation is streaming");
+            return out;
+        }
+        conv.deleteStored();
+        out.put("httpStatus", 200);
+        out.put("deleted", Boolean.TRUE);
+        return out;
+    }
+
+    private static org.moqui.entity.EntityFind conversationFind(ExecutionContext ec, String userId, boolean admin,
+            String profile, String purpose, String search) {
+        org.moqui.entity.EntityFind find = ec.getEntity().find("moqui.llm.LlmConversation");
+        if (!admin && userId != null) find.condition("userId", userId);
+        if (profile != null && !profile.isBlank()) find.condition("profileName", profile.trim());
+        if (purpose != null && !purpose.isBlank()) find.condition("purpose", purpose.trim());
+        String term = searchTerm(search);
+        if (term != null) {
+            String like = "%" + term + "%";
+            org.moqui.entity.EntityConditionFactory cf = ec.getEntity().getConditionFactory();
+            List<org.moqui.entity.EntityCondition> ors = new ArrayList<>();
+            // text-fts drops tokens shorter than 3 characters, so a short term matches summary and title only.
+            if (term.length() >= 3)
+                ors.add(cf.makeCondition("searchText", org.moqui.entity.EntityCondition.LIKE, like));
+            ors.add(cf.makeCondition("summary", org.moqui.entity.EntityCondition.LIKE, like));
+            ors.add(cf.makeCondition("title", org.moqui.entity.EntityCondition.LIKE, like));
+            find.condition(cf.makeCondition(ors, org.moqui.entity.EntityCondition.OR));
+        }
+        return find;
+    }
+
+    /** Legacy rows: fill purpose, createdDate, summary, and searchText, and move lastWriteUi into canvasJson. */
+    private static void backfillConversationList(ExecutionContext ec, String userId, boolean admin, String profile) {
+        if (ec == null || ec.getEntity() == null) return;
+        // One transaction so the header updates enlist and their record locks are cleared on commit.
+        LlmConversationImpl.persistIsolated(ec, () -> {
+        org.moqui.entity.EntityFind find = ec.getEntity().find("moqui.llm.LlmConversation")
+                .condition("summary", org.moqui.entity.EntityCondition.IS_NULL, null).limit(100);
+        if (!admin && userId != null) find.condition("userId", userId);
+        if (profile != null && !profile.isBlank()) find.condition("profileName", profile.trim());
+        org.moqui.entity.EntityList list = find.list();
+        if (list == null) return;
         for (org.moqui.entity.EntityValue ev : list) {
             if (ev == null) continue;
+            boolean changed = false;
             Map<String, Object> attrs = LlmJson.tryToMap(ev.getString("attributesJson"));
-            if (purpose != null && !purpose.isBlank()) {
-                String p = attrs != null ? str(attrs.get("purpose")) : null;
-                if (!purpose.equals(p)) continue;
+            String canvas = ev.getString("canvasJson");
+            if ((canvas == null || canvas.isBlank()) && attrs != null
+                    && attrs.get(WriteUiTool.ATTR_LAST_WRITE_UI) instanceof Map) {
+                ev.set("canvasJson", LlmJson.toJson(attrs.get(WriteUiTool.ATTR_LAST_WRITE_UI)));
+                ev.set("hasCanvas", "Y");
+                attrs.remove(WriteUiTool.ATTR_LAST_WRITE_UI);
+                ev.set("attributesJson", attrs.isEmpty() ? null : LlmJson.toJson(attrs));
+                changed = true;
             }
-            Map<String, Object> row = new LinkedHashMap<>();
-            row.put("conversationId", ev.getString("conversationId"));
-            row.put("profileName", ev.getString("profileName"));
-            row.put("userId", ev.getString("userId"));
-            row.put("status", ev.getString("statusId"));
-            row.put("title", ev.getString("title"));
-            row.put("lastMessageDate", ev.get("lastMessageDate"));
-            row.put("messageCount", ev.get("messageCount"));
-            row.put("attributes", attrs != null ? attrs : new LinkedHashMap<>());
-            out.add(row);
+            if (ev.getString("purpose") == null && attrs != null && attrs.get("purpose") != null
+                    && !attrs.get("purpose").toString().isBlank()) {
+                ev.set("purpose", attrs.get("purpose").toString().trim());
+                changed = true;
+            }
+            String id = ev.getString("conversationId");
+            if (ev.getTimestamp("createdDate") == null) {
+                java.sql.Timestamp started = earliestMessageDate(ec, id);
+                if (started == null) started = ev.getTimestamp("lastMessageDate");
+                if (started != null) {
+                    ev.set("createdDate", started);
+                    changed = true;
+                }
+            }
+            org.moqui.entity.EntityValue userMsg = firstUserMessage(ec, id);
+            String text = userMsg != null ? userMsg.getString("content") : null;
+            String summary;
+            if (text != null && !text.isBlank()) summary = ConversationSummary.truncate(text);
+            else if (ev.getString("title") != null && !ev.getString("title").isBlank())
+                summary = ConversationSummary.truncate(ev.getString("title"));
+            else summary = "New conversation";
+            ev.set("summary", summary);
+            ev.set("searchText", text != null && !text.isBlank()
+                    ? ConversationSummary.cap(text, ConversationSummary.SEARCH_MAX) : summary);
+            changed = true;
+            if (changed) ev.update();
         }
-        return out;
+        });
+    }
+
+    private static java.sql.Timestamp earliestMessageDate(ExecutionContext ec, String conversationId) {
+        if (conversationId == null) return null;
+        org.moqui.entity.EntityList list = ec.getEntity().find("moqui.llm.LlmMessage")
+                .condition("conversationId", conversationId).orderBy("sentDate").limit(1).list();
+        if (list == null || list.isEmpty()) return null;
+        return list.get(0).getTimestamp("sentDate");
+    }
+
+    private static org.moqui.entity.EntityValue firstUserMessage(ExecutionContext ec, String conversationId) {
+        if (conversationId == null) return null;
+        org.moqui.entity.EntityList list = ec.getEntity().find("moqui.llm.LlmMessage")
+                .condition("conversationId", conversationId).condition("role", "USER")
+                .orderBy("ordinal").limit(1).list();
+        if (list == null || list.isEmpty()) return null;
+        return list.get(0);
+    }
+
+    private static String searchTerm(String search) {
+        if (search == null) return null;
+        String cleaned = search.replace('%', ' ').replace('_', ' ').trim();
+        if (cleaned.isEmpty()) return null;
+        return cleaned;
+    }
+
+    private static Long millis(java.sql.Timestamp ts) {
+        return ts == null ? null : ts.getTime();
     }
 
     /** Profiles the current user is authorized to use (AT_LLM VIEW). Names + model, never keys. */
@@ -526,6 +753,7 @@ public final class LlmGateway {
                     row.put("allowUnprefixedRequest", ps.allowUnprefixedRequest);
                     row.put("allowEnterSim", ps.allowEnterSim);
                     row.put("allowClientSystem", ps.allowClientSystem);
+                    row.put("allowVueSfc", ps.allowVueSfc);
                 }
                 out.add(row);
             } catch (ArtifactAuthorizationException ignored) {
@@ -603,6 +831,8 @@ public final class LlmGateway {
         Map<String, Object> args = LlmJson.tryToMap(call.arguments);
         m.put("arguments", args != null ? args : call.arguments);
         m.put("execution", executionName(call.execution));
+        if (Boolean.TRUE.equals(call.confirm)) m.put("confirm", Boolean.TRUE);
+        if (call.risk != null && !call.risk.isBlank()) m.put("risk", call.risk);
         m.put("summary", LlmTrace.summarizeCall(call.name, args != null ? args : call.arguments));
         return m;
     }

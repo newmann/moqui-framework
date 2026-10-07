@@ -41,6 +41,9 @@ class LlmServletTests extends Specification {
         LlmGateway.parseRoute("/v1/chat/100/cancel").op == LlmGateway.Route.Op.CANCEL
         LlmGateway.parseRoute("/v1/conversations/100/cancel").op == LlmGateway.Route.Op.CANCEL
         LlmGateway.parseRoute("/v1/conversations/100").op == LlmGateway.Route.Op.GET_CONVERSATION
+        LlmGateway.parseRoute("/v1/conversations/100", "DELETE").op == LlmGateway.Route.Op.DELETE_CONVERSATION
+        LlmGateway.parseRoute("/v1/conversations/100", "DELETE").conversationId == "100"
+        LlmGateway.parseRoute("/v1/conversations/100", "GET").op == LlmGateway.Route.Op.GET_CONVERSATION
         LlmGateway.parseRoute("/v1/conversations").op == LlmGateway.Route.Op.LIST_CONVERSATIONS
         LlmGateway.parseRoute("/v1/profiles").op == LlmGateway.Route.Op.GET_PROFILES
         LlmGateway.parseRoute("/v1/chat").isPost()
@@ -115,6 +118,7 @@ class LlmServletTests extends Specification {
         LlmGateway.parseTools(null).isEmpty()
         LlmGateway.parseTools(["request", "write-ui"]) == ["request", "write_ui"]
         LlmGateway.parseTools(["browse", "run-service"]).containsAll(["browse", "run_service"])
+        LlmGateway.parseTools(["find_basic"]) == ["find_basic"]
         when:
         LlmGateway.parseTools(["request", "clean_llm"])
         then:
@@ -404,6 +408,17 @@ class LlmServletTests extends Specification {
         text.contains('"t":')
         text.contains("event: done\n")
         text.contains("data: ")
+    }
+
+    def "upstream open is an llm SSE event"() {
+        given:
+        def sw = new StringWriter()
+        def listener = new ServletStreamListener(new SseSink(sw), null)
+        when:
+        listener.onUpstreamOpen()
+        then:
+        sw.toString().startsWith("event: llm\n")
+        sw.toString().contains('"connected":true')
     }
 
     def "withoutCallerTx suspends an in-place JTA TX so call() does not fail-fast"() {

@@ -35,6 +35,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 public class LlmFacadeImpl implements LlmFacade {
     private static final Logger logger = LoggerFactory.getLogger(LlmFacadeImpl.class);
@@ -45,6 +47,9 @@ public class LlmFacadeImpl implements LlmFacade {
     private final Map<String, LlmTool.Factory> clientToolTypes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, RestClient.RestStream> inFlight = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> cancelledIds = new ConcurrentHashMap<>();
+    /** Conversation ids with a turn running in this JVM. The value is the claim token. */
+    private final ConcurrentHashMap<String, Long> activeTurns = new ConcurrentHashMap<>();
+    private static final java.util.concurrent.atomic.AtomicLong activeTurnSeq = new java.util.concurrent.atomic.AtomicLong();
     private final boolean enabledFlag;
     private final String defaultProfileName;
     private boolean anyUrl = false;
@@ -175,6 +180,21 @@ public class LlmFacadeImpl implements LlmFacade {
     public boolean isCancelled(String conversationId) {
         return conversationId != null && cancelledIds.containsKey(conversationId);
     }
+    /** True while a turn in this JVM has claimed the conversation and not released it. */
+    public boolean turnClaimed(String conversationId) {
+        return conversationId != null && activeTurns.containsKey(conversationId);
+    }
+    /** Replace any claim. The token is what {@link #releaseTurn} must pass so a 409 cannot drop another turn's claim. */
+    public long claimTurn(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return 0L;
+        long token = activeTurnSeq.incrementAndGet();
+        activeTurns.put(conversationId, token);
+        return token;
+    }
+    public void releaseTurn(String conversationId, long token) {
+        if (conversationId == null || token <= 0L) return;
+        activeTurns.remove(conversationId, token);
+    }
     public void clearCancelled(String conversationId) {
         if (conversationId != null) cancelledIds.remove(conversationId);
     }
@@ -263,6 +283,9 @@ public class LlmFacadeImpl implements LlmFacade {
         public final boolean allowRunService;
         public final boolean allowUnprefixedRequest;
         public final boolean allowEnterSim;
+        public final boolean allowVueSfc;
+        public final boolean summarizeConversation;
+        public final List<BasicEntityAllow> allowedBasicEntities;
 
         ProfileState(String name, MNode confNode, String url, String path, String endpointUrl, String apiKey,
                 String authHeaderName, String authHeaderValue, String model, String maxTokensParameter,
@@ -274,7 +297,8 @@ public class LlmFacadeImpl implements LlmFacade {
                 Set<String> allowedEntities, List<AllowedPath> allowedPaths,
                 boolean allowWriteUi, int ssePingSeconds, String systemLocation, boolean allowClientSystem,
                 boolean allowBrowse, boolean allowRunService, boolean allowUnprefixedRequest,
-                boolean allowEnterSim) {
+                boolean allowEnterSim, boolean allowVueSfc, boolean summarizeConversation,
+                List<BasicEntityAllow> allowedBasicEntities) {
             this.name = name;
             this.confNode = confNode;
             this.url = url;
@@ -309,6 +333,9 @@ public class LlmFacadeImpl implements LlmFacade {
             this.allowRunService = allowRunService;
             this.allowUnprefixedRequest = allowUnprefixedRequest;
             this.allowEnterSim = allowEnterSim;
+            this.allowVueSfc = allowVueSfc;
+            this.summarizeConversation = summarizeConversation;
+            this.allowedBasicEntities = allowedBasicEntities != null ? allowedBasicEntities : Collections.emptyList();
         }
 
         static ProfileState fromConf(String name, MNode node, ExecutionContextFactoryImpl ecfi) {
@@ -343,11 +370,13 @@ public class LlmFacadeImpl implements LlmFacade {
             String systemLocation = node.attribute("system-location");
             if (systemLocation != null) systemLocation = systemLocation.trim();
             if (systemLocation != null && systemLocation.isEmpty()) systemLocation = null;
-            boolean allowClientSystem = parseBoolean(node.attribute("allow-client-system"), true);
+            boolean allowClientSystem = parseBoolean(node.attribute("allow-client-system"), false);
             boolean allowBrowse = parseBoolean(node.attribute("allow-browse"), false);
             boolean allowRunService = parseBoolean(node.attribute("allow-run-service"), false);
             boolean allowUnprefixedRequest = parseBoolean(node.attribute("allow-unprefixed-request"), false);
             boolean allowEnterSim = parseBoolean(node.attribute("allow-enter-sim"), false);
+            boolean allowVueSfc = parseBoolean(node.attribute("allow-vue-sfc"), false);
+            boolean summarizeConversation = parseBoolean(node.attribute("summarize-conversation"), false);
 
             Map<String, String> extraHeaders = new LinkedHashMap<>();
             for (MNode header : node.children("header")) {
@@ -374,6 +403,15 @@ public class LlmFacadeImpl implements LlmFacade {
                 if (prefix == null || prefix.isBlank()) continue;
                 allowedPaths.add(new AllowedPath(prefix, nvl(ap.attribute("methods"), "GET")));
             }
+            List<BasicEntityAllow> allowedBasic = new ArrayList<>();
+            for (MNode be : node.children("allowed-basic-entity")) {
+                try {
+                    allowedBasic.add(new BasicEntityAllow(be.attribute("package"), be.attribute("entity")));
+                } catch (PatternSyntaxException e) {
+                    throw new LlmException("Invalid allowed-basic-entity pattern on profile " + name
+                            + ": " + e.getMessage());
+                }
+            }
 
             String endpointUrl = OpenAiCompatProtocol.composeEndpointUrl(url, path, extraQuery);
 
@@ -399,7 +437,7 @@ public class LlmFacadeImpl implements LlmFacade {
                     rf, protocol, Collections.unmodifiableSet(allowedEntities),
                     Collections.unmodifiableList(allowedPaths), allowWriteUi, ssePingSeconds,
                     systemLocation, allowClientSystem, allowBrowse, allowRunService, allowUnprefixedRequest,
-                    allowEnterSim);
+                    allowEnterSim, allowVueSfc, summarizeConversation, Collections.unmodifiableList(allowedBasic));
         }
 
         /** Test helper: no HTTP pool. */
@@ -420,7 +458,8 @@ public class LlmFacadeImpl implements LlmFacade {
                     Collections.emptyMap(), Collections.emptyMap(), null, protocol,
                     Collections.emptySet(),
                     allowedPaths != null ? allowedPaths : Collections.emptyList(),
-                    allowWriteUi, 15, null, true, false, false, false, false);
+                    allowWriteUi, 15, null, true, false, false, false, false, false, false,
+                    Collections.emptyList());
         }
         public static ProfileState forTest(String name, LlmProtocol protocol, String model,
                 boolean allowTxOverHttp, int emptyRetries, float retryInitialSeconds, int retryMax,
@@ -441,6 +480,15 @@ public class LlmFacadeImpl implements LlmFacade {
                 boolean allowTxOverHttp, int emptyRetries, float retryInitialSeconds, int retryMax,
                 List<AllowedPath> allowedPaths, boolean allowWriteUi, boolean allowUnprefixedRequest,
                 boolean allowBrowse, boolean allowRunService, boolean allowClientSystem, boolean allowEnterSim) {
+            return forTest(name, protocol, model, allowTxOverHttp, emptyRetries, retryInitialSeconds, retryMax,
+                    allowedPaths, allowWriteUi, allowUnprefixedRequest, allowBrowse, allowRunService,
+                    allowClientSystem, allowEnterSim, false);
+        }
+        public static ProfileState forTest(String name, LlmProtocol protocol, String model,
+                boolean allowTxOverHttp, int emptyRetries, float retryInitialSeconds, int retryMax,
+                List<AllowedPath> allowedPaths, boolean allowWriteUi, boolean allowUnprefixedRequest,
+                boolean allowBrowse, boolean allowRunService, boolean allowClientSystem, boolean allowEnterSim,
+                boolean summarizeConversation) {
             if (protocol == null) protocol = new OpenAiCompatProtocol();
             return new ProfileState(name, null, "http://127.0.0.1", OpenAiCompatProtocol.DEFAULT_PATH,
                     "http://127.0.0.1/v1/chat/completions", "", "Authorization", null,
@@ -451,7 +499,7 @@ public class LlmFacadeImpl implements LlmFacade {
                     Collections.emptySet(),
                     allowedPaths != null ? allowedPaths : Collections.emptyList(),
                     allowWriteUi, 15, null, allowClientSystem, allowBrowse, allowRunService, allowUnprefixedRequest,
-                    allowEnterSim);
+                    allowEnterSim, false, summarizeConversation, Collections.emptyList());
         }
     }
 
@@ -461,6 +509,39 @@ public class LlmFacadeImpl implements LlmFacade {
         public AllowedPath(String prefix, String methodsCsv) {
             this.prefix = prefix;
             this.methodsCsv = methodsCsv;
+        }
+    }
+
+    /**
+     * One allowed-basic-entity element. package and entity are full-string regexes.
+     * A null pattern means that side is not constrained. Both null matches nothing.
+     */
+    public static final class BasicEntityAllow {
+        public final Pattern packagePattern;
+        public final Pattern entityPattern;
+
+        public BasicEntityAllow(String packagePattern, String entityPattern) {
+            this.packagePattern = compile(packagePattern);
+            this.entityPattern = compile(entityPattern);
+        }
+        private static Pattern compile(String raw) {
+            if (raw == null || raw.isBlank()) return null;
+            return Pattern.compile(raw.trim());
+        }
+        public boolean matches(String packageName, String entityName) {
+            if (packagePattern == null && entityPattern == null) return false;
+            if (packagePattern != null && (packageName == null || !packagePattern.matcher(packageName).matches()))
+                return false;
+            if (entityPattern != null && (entityName == null || !entityPattern.matcher(entityName).matches()))
+                return false;
+            return true;
+        }
+        public static boolean any(List<BasicEntityAllow> rules, String packageName, String entityName) {
+            if (rules == null) return false;
+            for (BasicEntityAllow rule : rules) {
+                if (rule != null && rule.matches(packageName, entityName)) return true;
+            }
+            return false;
         }
     }
 }

@@ -61,6 +61,8 @@ class A2AJsonRpcTests extends Specification {
 
     def setup() {
         ec.artifactExecution.disableAuthz()
+        // SendStreamingMessage pushes AT_LLM; the suite shares one hit cache with the 30/60s LlmProfiles tarpit.
+        ec.artifactExecution.disableTarpit()
         if (!ec.user.userId) assert ec.user.loginUser('john.doe', 'moqui')
         if (ec.transaction.isTransactionInPlace()) ec.transaction.commit()
         clearA2AData()
@@ -75,6 +77,7 @@ class A2AJsonRpcTests extends Specification {
         if (ec.transaction.isTransactionInPlace()) ec.transaction.rollback('A2A JSON-RPC test cleanup', null)
         clearA2AData()
         ec.artifactExecution.enableAuthz()
+        ec.artifactExecution.enableTarpit()
     }
 
     def 'envelope and version errors use JSON-RPC and A2A codes'() {
@@ -224,6 +227,24 @@ class A2AJsonRpcTests extends Specification {
         out.toString() == 'data: {"jsonrpc":"2.0","id":"req-1","result":{"statusUpdate":{"taskId":"t1"}}}\n\n: ping\n\n'
         sink.emitted == 1
         !afterClose
+    }
+
+    def 'send-stream ping timer writes a comment during a quiet provider wait'() {
+        given:
+        StringWriter out = new StringWriter()
+        A2ASseSink sink = new A2ASseSink(out, 'req-ping')
+        def future = org.moqui.impl.llm.a2a.A2AExecutorImpl.scheduleSendPing(sink, 1L, null)
+
+        when:
+        long deadline = System.currentTimeMillis() + 4000L
+        while (System.currentTimeMillis() < deadline && !out.toString().contains(': ping')) Thread.sleep(50)
+
+        then:
+        out.toString().contains(': ping\n\n')
+
+        cleanup:
+        future?.cancel(false)
+        sink.close()
     }
 
     def 'internal failures never leak implementation details to the caller'() {
