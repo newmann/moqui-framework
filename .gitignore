@@ -35,6 +35,8 @@ build
 /docker/minio/
 /docker/rustfs/ 
 
+
+
 # IntelliJ IDEA files
 .idea
 out
@@ -82,6 +84,7 @@ nb-configuration.xml
 .roo/
 .aider/
 .grok/
+.codebuddy
 
 # Env style secrets
 .env

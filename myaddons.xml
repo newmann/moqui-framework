@@ -37,6 +37,7 @@
     <component name="collie-fasm" group="newmann" version="1.0.0" branch="master"/>
     <component name="collie-drive" group="newmann" version="0.1.0" branch="master"/>
     <component name="collie-search" group="newmann" version="0.1.0" branch="master"/>
+    <component name="collie-llm" group="newmann" version="0.1.0" branch="master"/>
 
     <component-set name="mantle" components="mantle-udm,mantle-usl,SimpleScreens,framework-zh_CN,base-component-zh_CN,mantle-udm-zh_CN,mantle-usl-zh_CN,SimpleScreens-zh_CN"/>
     <component-set name="newmann-tool" components="qapps2,collie-flowable,collie-wf-flowable"/>
