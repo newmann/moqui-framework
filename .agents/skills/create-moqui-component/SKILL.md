@@ -173,12 +173,18 @@ not duplicate `framework/data/CommonL10nData.xml`. Full rules:
 <?xml version="1.0" encoding="UTF-8"?>
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
-        default-menu-title="My App" require-authentication="true">
+        default-menu-title="My App" require-authentication="true"
+        menu-image="fa fa-folder" menu-image-type="icon">
     <widgets>
         <label text="My App" type="h3"/>
     </widgets>
 </screen>
 ```
+
+Replace `fa fa-folder` with a class that matches the app title. Put the
+same two attributes on every visible subscreen's `<screen>`, not on
+`<subscreens-item>` or `MoquiConf.xml`. Icon table and FA4 rule:
+`.agents/skills/moqui-xml-dsls/references/screen.md`.
 
 Before adding Find/Edit screens: read
 `.agents/skills/moqui-xml-dsls/references/screen-ui-patterns.md` (FK

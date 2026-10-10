@@ -17,7 +17,8 @@ Subscreen sources (later wins): directory `subscreens/`, screen XML
 
 ```xml
 <!-- good: simple app root; mount it in MoquiConf.xml -->
-<screen default-menu-title="My App" require-authentication="true">
+<screen default-menu-title="My App" require-authentication="true"
+        menu-image="fa fa-folder" menu-image-type="icon">
     <widgets>
         <form-single name="FindWidget" transition="search">
             <field name="widgetName"><default-field><text-line/></default-field></field>
@@ -110,3 +111,39 @@ Subscreen sources (later wins): directory `subscreens/`, screen XML
   | Disable | `fa fa-ban` |
   | Copy | `fa fa-copy` |
   | Refresh | `fa fa-refresh` |
+- Every screen that appears in a menu needs both `menu-image` and
+  `menu-image-type="icon"` on its own `<screen>` element. That includes
+  the app root and each visible subscreen (directory screens and
+  `<subscreens-item>` targets). `menu-image-type` defaults to
+  `url-screen`; a class name without `icon` is treated as a screen URL
+  and does not render. `<subscreens-item>` and `MoquiConf.xml` have no
+  icon attribute. Screens with `menu-include="false"` or
+  `default-menu-include="false"` can omit it. A child with no
+  `menu-image` inherits the parent's icon, so set one on each visible
+  screen.
+- Pick the class from the English `menu-title` / `default-menu-title`.
+  Use Font Awesome 4 names (`fa fa-*`). `/qapps` loads FA4 only;
+  `/qapps2` has a v4 shim, so FA4 names work on both. Do not use
+  FA5-only names (`fa-file-invoice-dollar`, `fa-handshake-simple`).
+  Match the table below first. If no row matches, choose an FA4
+  `fa fa-*` class whose glyph matches the title (a calendar screen
+  uses `fa fa-calendar`). Use `fa fa-folder` only when no FA4 glyph
+  fits.
+
+  | Title keywords | `menu-image` |
+  |----------------|--------------|
+  | Dashboard | `fa fa-dashboard` |
+  | Home | `fa fa-home` |
+  | Search, Find | `fa fa-search` |
+  | List, Requests | `fa fa-list` |
+  | Task, Todo | `fa fa-tasks` |
+  | Chat | `fa fa-comments` |
+  | Knowledge, Wiki, Doc | `fa fa-book` |
+  | File, Drive, Folder | `fa fa-folder-open` |
+  | User, Account, Party | `fa fa-user` |
+  | Settings, Config, Admin | `fa fa-cogs` |
+  | Monitor | `fa fa-desktop` |
+  | Report | `fa fa-bar-chart` |
+  | Process, Workflow | `fa fa-sitemap` |
+  | Asset | `fa fa-cubes` |
+  | Order, Cart | `fa fa-shopping-cart` |
