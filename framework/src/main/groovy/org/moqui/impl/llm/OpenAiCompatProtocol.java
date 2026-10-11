@@ -471,7 +471,10 @@ public class OpenAiCompatProtocol implements LlmProtocol {
                 }
             }
             String think = LlmRetryClassifier.reasoningOf(delta);
-            if (think != null && !think.isEmpty()) reasoning.append(think);
+            if (think != null && !think.isEmpty()) {
+                reasoning.append(think);
+                if (listener != null) listener.onReasoningDelta(think);
+            }
 
             Object tcs = delta.get("tool_calls");
             if (tcs instanceof List) {

@@ -18,6 +18,8 @@ import java.util.List;
 
 public final class LlmResponse {
     public String content;
+    /** Provider thinking / reasoning_content when present. Not sent back as the next prompt. */
+    public String reasoning;
     public LlmFinishReason finishReason;
     public List<LlmToolCall> toolCalls;
     public LlmUsage usage;
@@ -36,6 +38,7 @@ public final class LlmResponse {
     public LlmResponse() { }
 
     public String getContent() { return content; }
+    public String getReasoning() { return reasoning; }
     public LlmFinishReason getFinishReason() { return finishReason; }
     public List<LlmToolCall> getToolCalls() { return toolCalls != null ? toolCalls : new ArrayList<>(); }
     public LlmUsage getUsage() { return usage; }

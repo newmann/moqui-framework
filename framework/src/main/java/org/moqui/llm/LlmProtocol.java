@@ -86,5 +86,7 @@ public interface LlmProtocol {
         void onFailure(Throwable t);
         /** Partial tool-call arguments while streaming (write_ui lang onto the canvas). */
         default void onToolCallDelta(String name, String argumentsSoFar) { }
+        /** Provider thinking / reasoning_content while the model is still streaming. */
+        default void onReasoningDelta(String textDelta) { }
     }
 }

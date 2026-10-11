@@ -316,6 +316,9 @@ final class LlmAgentLoop {
                     @Override public void onDelta(String textDelta) {
                         if (textDelta != null && !textDelta.isEmpty()) listener.onDelta(textDelta);
                     }
+                    @Override public void onReasoningDelta(String textDelta) {
+                        if (textDelta != null && !textDelta.isEmpty()) listener.onReasoningDelta(textDelta);
+                    }
                     @Override public void onToolCallDelta(String name, String argumentsSoFar) {
                         listener.onToolCallDelta(name, argumentsSoFar);
                     }

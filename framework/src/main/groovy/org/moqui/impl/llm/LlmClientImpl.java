@@ -294,6 +294,9 @@ public class LlmClientImpl implements LlmClient {
                     @Override public void onDelta(String textDelta) {
                         if (textDelta != null && !textDelta.isEmpty()) listener.onDelta(textDelta);
                     }
+                    @Override public void onReasoningDelta(String textDelta) {
+                        if (textDelta != null && !textDelta.isEmpty()) listener.onReasoningDelta(textDelta);
+                    }
                     @Override public void onToolCallDelta(String name, String argumentsSoFar) {
                         listener.onToolCallDelta(name, argumentsSoFar);
                     }
@@ -653,6 +656,7 @@ public class LlmClientImpl implements LlmClient {
     LlmResponse toResponse(ProtocolResult result, LlmFinishReason fr, long start) {
         LlmResponse r = new LlmResponse();
         r.content = result.content;
+        r.reasoning = result.reasoning;
         r.finishReason = fr;
         r.toolCalls = result.toolCalls;
         r.usage = result.usage;

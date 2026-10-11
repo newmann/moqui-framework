@@ -20,6 +20,8 @@ public interface LlmStreamListener {
     /** Provider response headers arrived. Tokens may still be pending. */
     default void onUpstreamOpen() { }
     default void onDelta(String textDelta) { }
+    /** Provider thinking / reasoning_content while the model is still streaming. */
+    default void onReasoningDelta(String textDelta) { }
     /** Partial write_ui (or other client tool) arguments while the model is still streaming. */
     default void onToolCallDelta(String name, String argumentsSoFar) { }
     default void onToolCall(LlmToolCall call, LlmTool.Execution execution) { }

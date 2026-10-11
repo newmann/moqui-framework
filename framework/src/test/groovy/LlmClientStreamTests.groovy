@@ -135,6 +135,7 @@ class LlmClientStreamTests extends Specification {
         listener.complete.reasoning == "Let me think."
         listener.complete.content == "Hello"
         listener.deltas == ["Hello"]
+        listener.reasoningDeltas == ["Let me ", "think."]
     }
 
     def "tool_call argument chunks are concatenated by index"() {
@@ -263,10 +264,12 @@ class LlmClientStreamTests extends Specification {
 
     static class ProtoListener implements ProtocolStreamListener {
         List<String> deltas = []
+        List<String> reasoningDeltas = []
         List<Map> toolCallDeltas = []
         ProtocolResult complete
         Throwable failure
         @Override void onDelta(String textDelta) { deltas.add(textDelta) }
+        @Override void onReasoningDelta(String textDelta) { reasoningDeltas.add(textDelta) }
         @Override void onToolCallDelta(String name, String argumentsSoFar) {
             toolCallDeltas.add([name: name, arguments: argumentsSoFar])
         }
