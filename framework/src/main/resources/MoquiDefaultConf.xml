@@ -496,6 +496,8 @@
              Assist profile (tools component) sets allow-unprefixed-request instead. -->
     </llm-facade>
 
+    <embedding-facade enabled="true"/>
+
     <entity-facade default-group-name="transactional" entity-eca-enabled="true" sequenced-id-prefix=""
             distributed-cache-invalidate="false" dci-topic-factory="" query-stats="false"
             database-locale="${default_locale}" database-time-zone="${database_time_zone ?: default_time_zone}"

@@ -32,6 +32,7 @@ along with this software (see the LICENSE.md file). If not, see
                 <xs:element minOccurs="0" ref="service-facade"/>
                 <xs:element minOccurs="0" ref="elastic-facade"/>
                 <xs:element minOccurs="0" ref="llm-facade"/>
+                <xs:element minOccurs="0" ref="embedding-facade"/>
                 <xs:element minOccurs="0" ref="entity-facade"/>
                 <xs:element minOccurs="0" ref="database-list"/>
                 <xs:element minOccurs="0" ref="repository-list"/>
@@ -724,6 +725,26 @@ along with this software (see the LICENSE.md file). If not, see
         </xs:sequence>
         <xs:attribute name="enabled" type="boolean-expandable" default="true"/>
         <xs:attribute name="default-profile" type="xs:string" default="default"/>
+    </xs:complexType></xs:element>
+
+    <!-- ===================== Embedding Facade Conf Root ===================== -->
+
+    <xs:element name="embedding-facade"><xs:complexType>
+        <xs:sequence>
+            <xs:element name="profile" minOccurs="0" maxOccurs="unbounded"><xs:complexType>
+                <xs:attribute name="name" type="xs:string" use="required"/>
+                <xs:attribute name="url" type="xs:string"/>
+                <xs:attribute name="path" type="xs:string" default="/v1/embeddings"/>
+                <xs:attribute name="api-key" type="xs:string"/>
+                <xs:attribute name="auth-header-name" type="xs:string" default="Authorization"/>
+                <xs:attribute name="auth-header-pattern" type="xs:string" default="Bearer ${api-key}"/>
+                <xs:attribute name="model" type="xs:string"/>
+                <xs:attribute name="dimension" type="xs:positiveInteger"/>
+                <xs:attribute name="timeout-seconds" type="xs:positiveInteger" default="60"/>
+                <xs:attribute name="disabled" type="boolean-expandable" default="false"/>
+            </xs:complexType></xs:element>
+        </xs:sequence>
+        <xs:attribute name="enabled" type="boolean-expandable" default="true"/>
     </xs:complexType></xs:element>
 
     <!-- ===================== Entity Facade Conf Root ===================== -->

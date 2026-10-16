@@ -1731,6 +1731,10 @@ class ExecutionContextFactoryImpl implements ExecutionContextFactory {
             })
         }
 
+        if (overrideNode.hasChild("embedding-facade")) {
+            baseNode.mergeChildWithChildKey(overrideNode, "embedding-facade", "profile", "name", null)
+        }
+
         if (overrideNode.hasChild("entity-facade")) {
             MNode efBaseNode = baseNode.first("entity-facade")
             MNode efOverrideNode = overrideNode.first("entity-facade")
