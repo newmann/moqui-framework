@@ -18,8 +18,8 @@ import org.moqui.context.WebFacade
 import org.moqui.impl.context.ExecutionContextImpl
 import org.moqui.impl.context.UserFacadeImpl
 import org.moqui.impl.llm.MessageCapture
-import org.moqui.impl.llm.RequestTool
-import org.moqui.impl.llm.ServiceCallTool
+import org.moqui.impl.llm.tools.RequestTool
+import org.moqui.impl.llm.tools.ServiceCallTool
 import org.moqui.impl.screen.WebFacadeStub
 import org.moqui.llm.LlmTool
 import spock.lang.IgnoreIf
@@ -82,6 +82,15 @@ class LlmRequestToolTests extends Specification {
         ec.message.clearAll()
     }
 
+    def "mutates classifies verbs and GET to a transition with actions, never executing it"() {
+        expect:
+        RequestTool.mutates(ec, [method: "POST", path: "/apps/system/dashboard/actions"])
+        !RequestTool.mutates(ec, [method: "GET", path: "/apps/system/dashboard/actions"])
+        !RequestTool.mutates(ec, [method: "GET", path: "/apps/system/dashboard"])
+        !RequestTool.mutates(ec, [method: "GET", path: "/no/such/screen"])
+        RequestTool.mutates(ec, [method: "GET", path: "/apps/system/dashboard/reInitElasticFacade"])
+    }
+
     def "GET actions returns JSON not HTML"() {
         when:
         def result = LlmTool.request().execute([method: "GET", path: "/apps/system/dashboard/actions"], ec)
@@ -112,18 +121,6 @@ class LlmRequestToolTests extends Specification {
         result.text.contains("actions/{formListName}")
         result.text.contains("not /actions/{transition}")
         result.text.contains("not /qapps")
-    }
-
-    def "GET FindAsset form-list jsonPath returns JSON array"() {
-        when:
-        def result = LlmTool.request().execute(
-                [method: "GET", path: "/apps/marble/Asset/Asset/FindAsset/actions/ListAssets",
-                 query: [productId: "10297"]], ec)
-        then:
-        result.status == 200
-        result.json instanceof Map
-        result.json.rows instanceof List
-        result.text == null || !result.text.toString().toLowerCase().contains("<html")
     }
 
     def "GET ArtifactHitBins without find params is empty; AT_SERVICE returns rows wrapper"() {

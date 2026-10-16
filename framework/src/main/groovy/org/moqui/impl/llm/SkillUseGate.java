@@ -14,6 +14,9 @@
 package org.moqui.impl.llm;
 
 import org.moqui.impl.context.ExecutionContextImpl;
+import org.moqui.impl.llm.tools.EnterSimTool;
+import org.moqui.impl.llm.tools.FindSkillTool;
+import org.moqui.impl.llm.tools.PinTool;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -22,13 +25,13 @@ import java.util.Map;
  * Opt-in Assist gate: refuse tools other than find_skill / enter_sim until a skill is
  * selected or the nested sim is active. Does not auto-enter sim.
  */
-final class SkillUseGate {
+public final class SkillUseGate {
     static final String ERROR = "skill_required";
     static final String INSTRUCTION =
             "No skill is selected and you are not in sim. Call find_skill (use select to activate a matching skill) "
-                    + "or enter_sim to explore, test, and write a skill. Do not browse, request, run_service, or write_ui until then.";
+                    + "or enter_sim to explore, test, and write a skill. Do not browse, request, run_service, write_ui, or screen_use until then.";
     static final String SYSTEM_ADDENDUM =
-            "Force Skill Use is on. Before browse, request, run_service, or write_ui: find_skill and select a skill "
+            "Force Skill Use is on. Before browse, request, run_service, write_ui, or screen_use: find_skill and select a skill "
                     + "(select argument), or enter_sim to explore, test, and write a skill. The server will refuse other "
                     + "tools until then. It will not enter sim for you.";
 
@@ -50,11 +53,11 @@ final class SkillUseGate {
         return m;
     }
 
-    static void activate(LlmClientImpl client, String skillName) {
+    public static void activate(LlmClientImpl client, String skillName) {
         if (client == null || skillName == null || skillName.isBlank()) return;
         client.activeSkillName = skillName;
         if (client.conversation != null) client.conversation.setAttribute("activeSkillName", skillName);
-        // The next model iteration reads this from the conversation window. Tool-result trim drops the widgets section.
-        LlmGateway.refreshContext(client, "skill-widgets", SkillIndex.activeWidgetText(client.ec, skillName));
+        // Full skill text when a summary is set, so tool-result trim cannot drop the detail. Empty when there is no summary.
+        LlmGateway.refreshContext(client, "skill-widgets", SkillIndex.activeDetailText(client.ec, skillName));
     }
 }

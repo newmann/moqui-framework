@@ -11,7 +11,7 @@
  * along with this software (see the LICENSE.md file). If not, see
  * <http://creativecommons.org/publicdomain/zero/1.0/>.
  */
-package org.moqui.impl.llm;
+package org.moqui.impl.llm.tools;
 
 import org.moqui.context.ArtifactAuthorizationException;
 import org.moqui.context.ArtifactTarpitException;
@@ -19,6 +19,12 @@ import org.moqui.context.AuthenticationRequiredException;
 import org.moqui.context.ExecutionContext;
 import org.moqui.context.WebFacade;
 import org.moqui.impl.context.ExecutionContextImpl;
+import org.moqui.impl.llm.LlmFacadeImpl;
+import org.moqui.impl.llm.MessageCapture;
+import org.moqui.impl.llm.ScreenSearchHints;
+import org.moqui.impl.llm.ToolResultTrim;
+import org.moqui.impl.screen.ScreenDefinition;
+import org.moqui.impl.screen.ScreenUrlInfo;
 import org.moqui.impl.screen.WebFacadeStub;
 import org.moqui.llm.LlmTool;
 import org.moqui.screen.ScreenRender;
@@ -41,7 +47,7 @@ import java.util.Set;
  * with authz and tarpit ON (ScreenTestImpl.renderInternal pattern, no extra thread).
  */
 public class RequestTool implements LlmTool {
-    static final String NAME = "request";
+    public static final String NAME = "request";
     static final String HTML_ERROR = "HTML screens are not valid tool results. " +
             "Use /apps (not /qapps). GET {screen}/actions for screen JSON, GET {screen}/actions/{formListName} " +
             "for form-list rows (browse jsonPath), or POST {screen}/{transitionName} for a named transition " +
@@ -118,6 +124,39 @@ public class RequestTool implements LlmTool {
             return renderOnScreen(ec, method, segments, query, body);
         } finally {
             MessageCapture.restore(ec, prior);
+        }
+    }
+
+    /**
+     * True when a request would change data. Any verb but GET/HEAD does. A GET also does when it
+     * lands on a screen transition that has actions and is not marked read-only, because Moqui
+     * runs transitions on GET and only requires the CSRF token for other verbs.
+     * An unresolvable path is treated as a read, like before.
+     */
+    public static boolean mutates(ExecutionContext ec, Map<String, Object> args) {
+        if (args == null) return false;
+        String method = str(args.get("method"));
+        if (method == null || method.isBlank()) return false;
+        method = method.trim().toUpperCase(Locale.ROOT);
+        if (!"GET".equals(method) && !"HEAD".equals(method)) return true;
+        return getTargetsWritableTransition(ec, str(args.get("path")));
+    }
+
+    static boolean getTargetsWritableTransition(ExecutionContext ec, String path) {
+        if (!(ec instanceof ExecutionContextImpl) || validatePath(path) != null) return false;
+        ExecutionContextImpl eci = (ExecutionContextImpl) ec;
+        try {
+            ScreenDefinition root = ScreenCatalog.webrootWithApps(eci);
+            if (root == null) return false;
+            ScreenUrlInfo sui = ScreenUrlInfo.getScreenUrlInfo(eci.screenFacade, root, root,
+                    new ArrayList<>(normalizePath(path)), null, 0);
+            if (sui == null || !sui.isTargetExists()) return false;
+            String name = sui.getTargetTransitionActualName();
+            if (name == null || name.isEmpty() || sui.getTargetScreen() == null) return false;
+            ScreenDefinition.TransitionItem ti = sui.getTargetScreen().getTransitionItem(name, "get");
+            return ti != null && !ti.isReadOnly();
+        } catch (Throwable t) {
+            return false;
         }
     }
 

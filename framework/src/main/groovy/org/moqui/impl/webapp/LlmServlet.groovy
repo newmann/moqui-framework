@@ -128,6 +128,14 @@ class LlmServlet extends HttpServlet {
                 case LlmGateway.Route.Op.GET_PROFILES:
                     sendJson(response, 200, [profiles: LlmGateway.listProfiles(ec)])
                     return
+                case LlmGateway.Route.Op.READ:
+                    Map<String, Object> read = LlmGateway.readData(ec, request.getParameter("profile"),
+                            request.getParameter("path"), request.getParameter("q"))
+                    int rst = read.get("status") instanceof Number ? ((Number) read.get("status")).intValue() : 200
+                    // The result's own status (a 404 from the screen, say) is data for the caller. The HTTP status says
+                    // whether the read endpoint itself accepted the request.
+                    sendJson(response, rst >= 400 && read.get("error") != null ? rst : 200, read)
+                    return
                 case LlmGateway.Route.Op.LIST_CONVERSATIONS:
                     int pageIndex = 0
                     String pageRaw = request.getParameter("pageIndex")
@@ -141,6 +149,12 @@ class LlmServlet extends HttpServlet {
                     return
                 case LlmGateway.Route.Op.GET_CONVERSATION:
                     sendJson(response, 200, LlmGateway.getConversationMap(ec, route.conversationId))
+                    return
+                case LlmGateway.Route.Op.UPDATE_CONVERSATION:
+                    Map<String, Object> updated = LlmGateway.updateReasoning(ec, route.conversationId, body)
+                    int ust = updated.get("httpStatus") instanceof Number ?
+                            ((Number) updated.get("httpStatus")).intValue() : 200
+                    sendJson(response, ust, updated)
                     return
                 case LlmGateway.Route.Op.DELETE_CONVERSATION:
                     Map<String, Object> deleted = LlmGateway.deleteConversation(ec, route.conversationId)
@@ -169,9 +183,11 @@ class LlmServlet extends HttpServlet {
         } catch (LlmException e) {
             sendJsonError(response, LlmGateway.httpStatusOf(e), e.message)
         } catch (Throwable t) {
-            logger.error("Error in LlmServlet", t)
+            // The message stays in the log. The client gets a reference so internals are not exposed.
+            String ref = Long.toString(System.nanoTime(), 36)
+            logger.error("Error in LlmServlet (ref ${ref})", t)
             if (!response.isCommitted())
-                sendJsonError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, t.message ?: t.toString())
+                sendJsonError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "Internal error (ref ${ref})".toString())
         } finally {
             MDC.remove("moqui_llm_conversationId")
             // Filter destroys the EC after service() returns.

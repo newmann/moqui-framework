@@ -490,10 +490,95 @@
     <llm-facade enabled="true" default-profile="default">
         <profile name="default" url="${llm_openai_url}" api-key="${llm_openai_api_key}"
                 model="${llm_openai_model}" log-content="${llm_log_content}"/>
-        <!-- No allowed-path: servlet does not attach the request tool. Add prefixes in runtime conf, e.g.:
+        <!-- No allowed-path on the default profile: the servlet does not attach the request tool. Add prefixes
+             in runtime conf, e.g.:
              <allowed-path prefix="/rest/s1/mantle/" methods="GET,POST,PUT,PATCH,DELETE"/>
              <allowed-path prefix="/qapps/mantle/" methods="GET"/>
-             Assist profile (tools component) sets allow-unprefixed-request instead. -->
+             The assist profile sets allow-unprefixed-request instead. system-location is the webroot prompt. -->
+        <profile name="assist" url="${llm_openai_url}" api-key="${llm_openai_api_key}"
+                model="${llm_openai_model}" log-content="${llm_log_content}"
+                allow-write-ui="true" allow-client-system="false"
+                allow-browse="true" allow-run-service="true"
+                allow-unprefixed-request="true" allow-enter-sim="true"
+                allow-vue-sfc="false" summarize-conversation="true"
+                timeout-seconds="360" max-iterations="30"
+                tool-result-max-chars="65536"
+                system-location="component://webroot/prompt/AssistSystem.ftl">
+            <allowed-basic-entity package="moqui.basic"/>
+        </profile>
+        <!-- Suggested api-config only. Not active. One level deep-merges onto base. A new conversation is low.
+             messages, input, instructions, tools, and stream are not replaced. Copy a block onto a real profile and set its api-key. -->
+        <!-- OpenAI Responses. Chat Completions cannot call tools with reasoning on for gpt-5.4 and later.
+             store is forced false. Replay items are tied to the deployment that minted them; start a new
+             conversation to move provider. Temperature is omitted when reasoning.effort is not none.
+        <profile name="openai" url="https://api.openai.com" api-key="${llm_openai_api_key}" model="gpt-5.4"
+                protocol="org.moqui.impl.llm.OpenAiResponsesProtocol">
+            <api-config>
+                <low>{"reasoning":{"effort":"low"}}</low>
+                <medium>{"reasoning":{"effort":"medium"}}</medium>
+                <high>{"reasoning":{"effort":"high"}}</high>
+            </api-config>
+        </profile>
+        -->
+        <!-- xAI Responses. Same protocol as OpenAI. No off switch. grok-4.6 and later also accept xhigh when High should mean the maximum.
+             A Chat Completions profile still works for models that accept tools on that endpoint.
+        <profile name="xai" url="https://api.x.ai" api-key="${llm_xai_api_key}" model="grok-4.7"
+                protocol="org.moqui.impl.llm.OpenAiResponsesProtocol">
+            <api-config>
+                <low>{"reasoning":{"effort":"low"}}</low>
+                <medium>{"reasoning":{"effort":"medium"}}</medium>
+                <high>{"reasoning":{"effort":"high"}}</high>
+            </api-config>
+        </profile>
+        -->
+        <!-- NOT WORKING YET: needs a Messages API protocol class. Anthropic native Messages uses output_config.effort (low, medium, high; some models also xhigh and max), but OpenAiCompatProtocol still posts a Chat Completions body, so this profile would fail. Kept as the intended shape for when that protocol exists.
+        <profile name="anthropic" url="https://api.anthropic.com" path="/v1/messages" api-key="${llm_anthropic_api_key}" model="claude-sonnet-5" auth-header-name="x-api-key" auth-header-pattern="${api-key}">
+            <header name="anthropic-version" value="2023-06-01"/>
+            <api-config>
+                <low>{"output_config":{"effort":"low"}}</low>
+                <medium>{"output_config":{"effort":"medium"}}</medium>
+                <high>{"output_config":{"effort":"high"}}</high>
+            </api-config>
+        </profile>
+        -->
+        <!-- Gemini OpenAI-compat. reasoning_effort maps to thinking_level. gemini-3.8-flash rejects minimal. Thinking cannot be turned off. Path is /chat/completions, not /v1/chat/completions.
+        <profile name="gemini" url="https://generativelanguage.googleapis.com/v1beta/openai" path="/chat/completions" api-key="${llm_gemini_api_key}" model="gemini-3.8-flash">
+            <api-config>
+                <low>{"reasoning_effort":"low"}</low>
+                <medium>{"reasoning_effort":"medium"}</medium>
+                <high>{"reasoning_effort":"high"}</high>
+            </api-config>
+        </profile>
+        -->
+        <!-- Qwen 3.8. High is xhigh, the top of low, medium, xhigh. Low also turns thinking off. LM Studio MLX may drop these fields on /v1/chat/completions.
+        <profile name="qwen" url="http://127.0.0.1:1234" model="qwen3.8-27b">
+            <api-config>
+                <base>{"chat_template_kwargs":{"preserve_thinking":true}}</base>
+                <low>{"reasoning_effort":"low","chat_template_kwargs":{"enable_thinking":false}}</low>
+                <medium>{"reasoning_effort":"medium","chat_template_kwargs":{"enable_thinking":true}}</medium>
+                <high>{"reasoning_effort":"xhigh","chat_template_kwargs":{"enable_thinking":true}}</high>
+            </api-config>
+        </profile>
+        -->
+        <!-- GLM. glm-5.2 can disable thinking. glm-5.3 cannot. High is max.
+        <profile name="glm" url="https://api.z.ai/api/paas/v4" path="/chat/completions" api-key="${llm_glm_api_key}" model="glm-5.2">
+            <api-config>
+                <low>{"thinking":{"type":"disabled"}}</low>
+                <medium>{"thinking":{"type":"enabled"},"reasoning_effort":"high"}</medium>
+                <high>{"thinking":{"type":"enabled"},"reasoning_effort":"max"}</high>
+            </api-config>
+        </profile>
+        -->
+        <!-- DeepSeek. Thinking defaults on, so Low turns it off. max is the step above High.
+             Thinking-mode tool turns echo reasoning_content. thinking.type enabled with no captured text sends an empty string.
+        <profile name="deepseek" url="https://api.deepseek.com" path="/chat/completions" api-key="${llm_deepseek_api_key}" model="deepseek-flash">
+            <api-config>
+                <low>{"thinking":{"type":"disabled"}}</low>
+                <medium>{"thinking":{"type":"enabled"},"reasoning_effort":"low"}</medium>
+                <high>{"thinking":{"type":"enabled"},"reasoning_effort":"high"}</high>
+            </api-config>
+        </profile>
+        -->
     </llm-facade>
 
     <embedding-facade enabled="true"/>

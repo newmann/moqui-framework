@@ -11,11 +11,15 @@
  * along with this software (see the LICENSE.md file). If not, see
  * <http://creativecommons.org/publicdomain/zero/1.0/>.
  */
-package org.moqui.impl.llm;
+package org.moqui.impl.llm.tools;
 
 import org.moqui.context.ExecutionContext;
 import org.moqui.entity.EntityValue;
 import org.moqui.impl.context.ExecutionContextImpl;
+import org.moqui.impl.llm.LlmClientImpl;
+import org.moqui.impl.llm.LlmGateway;
+import org.moqui.impl.llm.LlmTrace;
+import org.moqui.impl.llm.SkillIndex;
 import org.moqui.llm.LlmClient;
 import org.moqui.llm.LlmResponse;
 import org.moqui.llm.LlmTool;
@@ -31,7 +35,7 @@ import java.util.Map;
  */
 public class EnterSimTool implements LlmTool {
     private static final Logger logger = LoggerFactory.getLogger(EnterSimTool.class);
-    static final String NAME = "enter_sim";
+    public static final String NAME = "enter_sim";
     private static final Map<String, Object> SCHEMA;
     static {
         Map<String, Object> props = new LinkedHashMap<>();
@@ -68,13 +72,13 @@ public class EnterSimTool implements LlmTool {
         String goal = args.get("goal") != null ? args.get("goal").toString() : "";
         String criteria = args.get("success_criteria") != null ? args.get("success_criteria").toString() : "";
         // Prove-then-optimize: give the nested model enough rounds to actually return a skill.
-        // Floor 32 so a parent tool-call cannot shrink the budget back to 8.
+        // Default 32. A caller may ask for fewer rounds, down to 4, or up to 64.
         int maxIter = 32;
         Object maxObj = args.get("max_iterations");
-        if (maxObj instanceof Number) maxIter = Math.max(32, Math.min(64, ((Number) maxObj).intValue()));
+        if (maxObj instanceof Number) maxIter = Math.max(4, Math.min(64, ((Number) maxObj).intValue()));
 
         ExecutionContextImpl eci = (ExecutionContextImpl) ec;
-        LlmClientImpl parent = LlmAgentLoop.currentClient();
+        LlmClientImpl parent = LlmClientImpl.currentClient();
         String convId = parent != null ? parent.convId() : null;
         if (eci.simSession) {
             Map<String, Object> already = new LinkedHashMap<>();
@@ -141,8 +145,16 @@ public class EnterSimTool implements LlmTool {
                 }
             }
         } catch (Throwable t) {
-            logger.warn("enter_sim nested agent failed", t);
-            result.put("error", "sim_failed");
+            org.moqui.impl.context.SimTerminatedException terminated = findTerminated(t);
+            if (terminated != null) {
+                logger.warn("enter_sim terminated: " + terminated.getMessage());
+                result.put("error", "sim_terminated");
+                result.put("terminated", Boolean.TRUE);
+                result.put("reason", terminated.getMessage());
+            } else {
+                logger.warn("enter_sim nested agent failed", t);
+                result.put("error", "sim_failed");
+            }
         } finally {
             Object proposed = result.get("proposedSkillName");
             Object err = result.get("error");
@@ -184,7 +196,21 @@ public class EnterSimTool implements LlmTool {
         return out;
     }
 
+    private static org.moqui.impl.context.SimTerminatedException findTerminated(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (cur instanceof org.moqui.impl.context.SimTerminatedException)
+                return (org.moqui.impl.context.SimTerminatedException) cur;
+            if (cur.getCause() == cur) break;
+        }
+        return null;
+    }
+
     public static String simExitHint(Map<String, Object> result) {
+        if (result != null && Boolean.TRUE.equals(result.get("terminated"))) {
+            return "The sim was terminated because a write could not be rolled back cleanly, so its state can no longer be "
+                    + "trusted. Sim writes never reached production. Nothing from this sim was kept. Call enter_sim again to "
+                    + "start a new sim for more testing, and avoid repeating the step that failed.";
+        }
         Object name = result != null ? result.get("proposedSkillName") : null;
         Object id = result != null ? result.get("proposedSkillId") : null;
         Object status = result != null ? result.get("proposedSkillStatus") : null;

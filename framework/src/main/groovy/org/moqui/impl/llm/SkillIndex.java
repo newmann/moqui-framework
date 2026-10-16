@@ -31,10 +31,12 @@ import java.util.function.Supplier;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Shipped component://…/skill/*.md plus admitted LlmSkill rows. See framework/plans/LlmSkillLearning.md.
@@ -42,10 +44,18 @@ import java.util.Map;
 public class SkillIndex {
     private static final Logger logger = LoggerFactory.getLogger(SkillIndex.class);
     public static final int DEFAULT_LIMIT = 5;
-    public static final int INJECT_CHARS = 4000;
+    /** Catalog inject budget. Over this, drop whole skills from the end. Never cut inside a skill. */
+    public static final int INJECT_CHARS = 32000;
+    /** Log signal only. A body at or over this length is still sent whole. */
+    public static final int BODY_WARN_CHARS = 4000;
+    /** Intent words. Kept for an exact name or title phrase, ignored as loose tokens. */
+    private static final Set<String> QUERY_STOP = new HashSet<>(Arrays.asList(
+            "show", "list", "find", "get", "what", "the", "for", "my", "a", "an", "open"));
 
     public static class SkillDoc {
-        public String name, title, description, body, risk, sourceLocation, skillId, statusId, provenanceId;
+        public String name, title, description, summary, body, risk, sourceLocation, skillId, statusId, provenanceId;
+        /** procedure (blank) or reference. Set from the type front-matter key of a shipped file or the LlmSkill kind field. */
+        public String kind;
         public Map<String, String> frontMatter = new LinkedHashMap<>();
     }
 
@@ -85,6 +95,11 @@ public class SkillIndex {
         doc.title = nz(doc.frontMatter.get("title"));
         if (doc.title.isEmpty()) doc.title = doc.name;
         doc.description = nz(doc.frontMatter.get("description"));
+        String summary = nz(doc.frontMatter.get("summary"));
+        doc.summary = summary.isEmpty() ? null : summary;
+        String kind = nz(doc.frontMatter.get("type"));
+        if (kind.isEmpty()) kind = nz(doc.frontMatter.get("kind"));
+        doc.kind = kind.isEmpty() ? null : kind.toLowerCase(Locale.ROOT);
         doc.risk = nz(doc.frontMatter.get("risk"));
         if (doc.risk.isEmpty()) doc.risk = "confirm";
         doc.statusId = "LsksActive";
@@ -92,9 +107,27 @@ public class SkillIndex {
         return doc;
     }
 
+    private static final long SHIPPED_TTL_MS = 15_000L;
+    private static volatile List<SkillDoc> shippedCache = null;
+    private static volatile Object shippedCacheOwner = null;
+    private static volatile long shippedCacheTime = 0L;
+
+    /** Shipped skill files, read from every component. Cached briefly because risk checks call this per tool call. */
     public static List<SkillDoc> scanShipped(ExecutionContext ec) {
+        if (ec == null || ec.getFactory() == null) return new ArrayList<>();
+        long now = System.currentTimeMillis();
+        List<SkillDoc> cached = shippedCache;
+        if (cached != null && shippedCacheOwner == ec.getFactory() && now - shippedCacheTime < SHIPPED_TTL_MS)
+            return new ArrayList<>(cached);
+        List<SkillDoc> fresh = scanShippedUncached(ec);
+        shippedCache = fresh;
+        shippedCacheOwner = ec.getFactory();
+        shippedCacheTime = now;
+        return new ArrayList<>(fresh);
+    }
+
+    private static List<SkillDoc> scanShippedUncached(ExecutionContext ec) {
         List<SkillDoc> out = new ArrayList<>();
-        if (ec == null || ec.getFactory() == null) return out;
         ExecutionContextFactoryImpl ecfi = (ExecutionContextFactoryImpl) ec.getFactory();
         Map<String, String> comps = ecfi.getComponentBaseLocations();
         for (Map.Entry<String, String> e : comps.entrySet()) {
@@ -211,6 +244,11 @@ public class SkillIndex {
         return doc != null && ("LsksActive".equals(doc.statusId) || "LsksProposed".equals(doc.statusId));
     }
 
+    /** True when a shipped skill file owns this name. Screens use it to refuse edits to a shadowing database row. */
+    public static boolean isShippedName(ExecutionContext ec, String name) {
+        return name != null && shippedByName(ec, name.trim()) != null;
+    }
+
     private static SkillDoc shippedByName(ExecutionContext ec, String name) {
         for (SkillDoc doc : scanShipped(ec)) {
             if (name.equals(doc.name)) return doc;
@@ -232,79 +270,91 @@ public class SkillIndex {
         }
     }
 
-    /** True for concept cards such as marble-party-roles. They are not write playbooks. */
+    /** True for concept cards, marked `type: reference` in a shipped file or kind=reference on the row. They are not write playbooks. */
     public static boolean isReference(SkillDoc doc) {
-        return doc != null && doc.name != null && doc.name.startsWith("marble-");
-    }
-
-    /** Widget lines are kept on the stored body and on the selected skill, not in catalog inject. */
-    public static String withoutWidgets(String body) {
-        if (body == null) return null;
-        int i = widgetIndex(body);
-        if (i < 0) return body;
-        return body.substring(0, i).stripTrailing();
-    }
-    public static String widgetsSection(String body) {
-        if (body == null) return null;
-        int i = widgetIndex(body);
-        if (i < 0) return null;
-        String section = body.substring(i).trim();
-        return section.isEmpty() ? null : section;
-    }
-    public static String activeWidgetText(ExecutionContext ec, String skillName) {
-        if (skillName == null || skillName.isBlank() || ec == null) return null;
-        SkillDoc doc = getByName(ec, skillName);
-        if (doc == null) return null;
-        return widgetsSection(doc.body);
-    }
-    private static int widgetIndex(String body) {
-        int i = body.indexOf("\n## Widgets");
-        if (i >= 0) return i + 1;
-        if (body.startsWith("## Widgets")) return 0;
-        return -1;
+        return doc != null && "reference".equalsIgnoreCase(doc.kind);
     }
 
     /**
-     * Procedure skills fill the inject slots. Reference cards are a short gloss beside them,
-     * not one of the three procedure slots.
+     * Catalog and query text. A summary when one is set, otherwise the full skill text.
+     * No heading is stripped.
+     */
+    public static String summaryText(SkillDoc doc) {
+        if (doc == null) return null;
+        if (doc.summary != null && !doc.summary.isBlank()) return doc.summary.trim();
+        return doc.body;
+    }
+
+    /**
+     * Full skill text for the active-skill context block, only when a summary is set.
+     * With no summary the catalog already carries the full text, so the block stays empty.
+     */
+    public static String activeDetailText(SkillDoc doc) {
+        if (doc == null || doc.summary == null || doc.summary.isBlank()) return null;
+        return doc.body;
+    }
+    public static String activeDetailText(ExecutionContext ec, String skillName) {
+        if (skillName == null || skillName.isBlank() || ec == null) return null;
+        return activeDetailText(getByName(ec, skillName));
+    }
+
+    /**
+     * Procedure skills fill the inject slots. Reference cards are a gloss beside them,
+     * not one of the three procedure slots. A procedure is injected only on a real match.
+     * A blank query keeps the first procedures.
      */
     public static String formatInjectForQuery(ExecutionContext ec, String query) {
-        List<SkillDoc> found = retrieve(ec, query, 15);
+        return formatInjectForDocs(ec, retrieve(ec, query, 15), query);
+    }
+
+    /** Inject for an already chosen list, in that order. Reference cards stay out of the procedure slots. */
+    public static String formatInjectForDocs(ExecutionContext ec, List<SkillDoc> found, String query) {
         List<Map<String, Object>> skills = new ArrayList<>();
-        List<Map<String, Object>> references = new ArrayList<>();
+        List<Map<String, Object>> cards = new ArrayList<>();
         if (found != null) {
             for (SkillDoc d : found) {
                 if (isReference(d)) {
-                    if (references.size() >= 2) continue;
-                    Map<String, Object> m = new LinkedHashMap<>();
-                    m.put("name", d.name);
-                    m.put("title", d.title);
-                    m.put("description", d.description);
-                    String body = withoutWidgets(d.body);
-                    if (body == null) body = "";
-                    else body = body.trim();
-                    if (body.length() > 400) body = body.substring(0, 400);
-                    m.put("body", body);
-                    references.add(m);
-                } else if (skills.size() < 3) {
+                    if (cards.size() >= 2) continue;
+                    cards.add(referenceMap(d));
+                } else if (skills.size() < 3 && includeProcedure(d, query)) {
                     Map<String, Object> m = new LinkedHashMap<>();
                     m.put("name", d.name);
                     m.put("title", d.title);
                     m.put("description", d.description);
                     m.put("risk", d.risk);
-                    m.put("body", withoutWidgets(d.body));
+                    m.put("body", injectBody(d));
                     m.put("lessons", lessonLines(ec, d.skillId));
                     skills.add(m);
                 }
             }
         }
-        Map<String, Object> ctx = new LinkedHashMap<>();
-        ctx.put("skills", skills);
-        ctx.put("references", references);
-        String text = LlmGateway.renderPrompt(ec, LlmGateway.PROMPT_SKILL_INJECT, ctx);
-        if (text == null) return "";
-        if (text.length() > INJECT_CHARS) return text.substring(0, INJECT_CHARS);
-        return text;
+        boolean hasProcedure = !skills.isEmpty();
+        skills.addAll(cards);
+        return fitInject(ec, skills, hasProcedure);
+    }
+
+    private static Map<String, Object> referenceMap(SkillDoc d) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("name", d.name);
+        m.put("title", d.title);
+        m.put("description", d.description);
+        m.put("reference", Boolean.TRUE);
+        m.put("body", injectBody(d));
+        return m;
+    }
+
+    /** Summary when set, otherwise the full body. Logged when large, always sent whole. */
+    private static String injectBody(SkillDoc d) {
+        String body = summaryText(d);
+        if (body == null) body = "";
+        else body = body.trim();
+        warnIfLarge(d != null ? d.name : null, body);
+        return body;
+    }
+
+    private static void warnIfLarge(String name, String body) {
+        if (body != null && body.length() >= BODY_WARN_CHARS)
+            logger.warn("LLM text {} is {} characters. It is sent whole.", name, body.length());
     }
 
     /** Active rows for a query. A non-empty query is an entity find, not a full table load. */
@@ -329,45 +379,120 @@ public class SkillIndex {
     public static String formatInject(ExecutionContext ec, List<SkillDoc> docs) {
         List<Map<String, Object>> skills = new ArrayList<>();
         if (docs != null) {
-            int remaining = INJECT_CHARS;
             for (SkillDoc d : docs) {
                 Map<String, Object> m = new LinkedHashMap<>();
                 m.put("name", d.name);
                 m.put("title", d.title);
                 m.put("description", d.description);
                 m.put("risk", d.risk);
-                m.put("body", withoutWidgets(d.body));
+                m.put("body", injectBody(d));
                 m.put("lessons", lessonLines(ec, d.skillId));
                 skills.add(m);
-                int approx = (d.body != null ? d.body.length() : 0) + 80;
-                remaining -= approx;
-                if (remaining <= 0) break;
             }
         }
-        Map<String, Object> ctx = new LinkedHashMap<>();
-        ctx.put("skills", skills);
-        String text = LlmGateway.renderPrompt(ec, LlmGateway.PROMPT_SKILL_INJECT, ctx);
-        if (text == null) return "";
-        if (text.length() > INJECT_CHARS) return text.substring(0, INJECT_CHARS);
+        return fitInject(ec, skills, null);
+    }
+
+    /** Over the budget, drop whole skills from the end. One skill that is still over is returned whole. */
+    private static String fitInject(ExecutionContext ec, List<Map<String, Object>> skills, Boolean hasProcedure) {
+        String text = renderInject(ec, skills, hasProcedure);
+        while (text.length() > INJECT_CHARS && skills.size() > 1) {
+            Map<String, Object> dropped = skills.remove(skills.size() - 1);
+            logger.warn("Skill inject over {} characters, dropped skill {}", INJECT_CHARS, dropped.get("name"));
+            text = renderInject(ec, skills, hasProcedure);
+        }
         return text;
     }
 
+    private static String renderInject(ExecutionContext ec, List<Map<String, Object>> skills, Boolean hasProcedure) {
+        Map<String, Object> ctx = new LinkedHashMap<>();
+        ctx.put("skills", skills);
+        if (hasProcedure != null) ctx.put("hasProcedure", hasProcedure);
+        String text = LlmGateway.renderPrompt(ec, LlmGateway.PROMPT_SKILL_INJECT, ctx);
+        return text == null ? "" : text;
+    }
+
+    /** A blank query keeps the top procedures. Any other query needs a real match. */
+    static boolean includeProcedure(SkillDoc doc, String query) {
+        return query == null || query.isBlank() || strongMatch(doc, query);
+    }
+
+    /** Name or title content token, or a phrase in the name, title, or description. */
+    public static boolean strongMatch(SkillDoc doc, String query) {
+        if (query == null || query.isBlank()) return false;
+        return scoreDetail(doc, query).strong;
+    }
+
+    public static final class ScoreDetail {
+        public final int score;
+        public final boolean strong;
+        ScoreDetail(int score, boolean strong) { this.score = score; this.strong = strong; }
+    }
+
     static int score(SkillDoc doc, String q) {
-        if (q == null || q.isEmpty()) return 1;
+        return scoreDetail(doc, q).score;
+    }
+
+    public static ScoreDetail scoreDetail(SkillDoc doc, String q) {
+        if (q == null || q.isEmpty()) return new ScoreDetail(1, false);
+        if (doc == null) return new ScoreDetail(0, false);
+        String query = normPhrase(q);
+        if (query.isEmpty()) return new ScoreDetail(1, false);
+        String name = normPhrase(nz(doc.name));
+        String title = normPhrase(nz(doc.title));
+        String desc = normPhrase(nz(doc.description));
+        String body = normPhrase(nz(doc.body));
         int s = 0;
-        String name = nz(doc.name).toLowerCase(Locale.ROOT);
-        String title = nz(doc.title).toLowerCase(Locale.ROOT);
-        String desc = nz(doc.description).toLowerCase(Locale.ROOT);
-        String body = nz(doc.body).toLowerCase(Locale.ROOT);
-        if (name.equals(q) || title.equals(q)) s += 100;
-        if (name.contains(q) || title.contains(q)) s += 40;
-        for (String tok : q.split("\\s+")) {
-            if (tok.length() < 3) continue;
-            if (name.contains(tok) || title.contains(tok)) s += 20;
-            else if (desc.contains(tok)) s += 8;
-            else if (body.contains(tok)) s += 2;
+        boolean strong = false;
+        if (name.equals(query) || title.equals(query)) { s += 100; strong = true; }
+        List<String> content = contentTokens(query);
+        if (!content.isEmpty() && (name.contains(query) || title.contains(query))) { s += 40; strong = true; }
+        for (String tok : content) {
+            if (containsTok(name, tok) || containsTok(title, tok)) { s += 20; strong = true; }
+            else if (containsTok(desc, tok)) s += 8;
+            else if (containsTok(body, tok)) s += 2;
         }
-        return s;
+        if (content.size() >= 2 && (phraseIn(name, content) || phraseIn(title, content) || phraseIn(desc, content))) {
+            s += 40;
+            strong = true;
+        }
+        return new ScoreDetail(s, strong);
+    }
+
+    private static String normPhrase(String s) {
+        return s.toLowerCase(Locale.ROOT).replace('-', ' ').trim().replaceAll("\\s+", " ");
+    }
+
+    private static List<String> contentTokens(String query) {
+        List<String> out = new ArrayList<>();
+        for (String tok : query.split(" ")) {
+            if (tok.isEmpty() || QUERY_STOP.contains(tok) || tok.length() < 3) continue;
+            String stemmed = stem(tok);
+            if (stemmed.length() < 3 || QUERY_STOP.contains(stemmed)) continue;
+            out.add(stemmed);
+        }
+        return out;
+    }
+
+    /** Trailing s, length at least 5, so orders matches order. A double s stays. */
+    private static String stem(String tok) {
+        if (tok.length() >= 5 && tok.endsWith("s") && !tok.endsWith("ss"))
+            return tok.substring(0, tok.length() - 1);
+        return tok;
+    }
+
+    private static boolean containsTok(String hay, String stemmedTok) {
+        return !hay.isEmpty() && !stemmedTok.isEmpty() && hay.contains(stemmedTok);
+    }
+
+    private static boolean phraseIn(String hay, List<String> words) {
+        int from = 0;
+        for (String w : words) {
+            int i = hay.indexOf(w, from);
+            if (i < 0) return false;
+            from = i + w.length();
+        }
+        return true;
     }
 
     static SkillDoc fromEntity(EntityValue ev) {
@@ -376,10 +501,12 @@ public class SkillIndex {
         d.name = ev.getString("name");
         d.title = ev.getString("title");
         d.description = ev.getString("description");
+        d.summary = ev.getString("summary");
         d.body = ev.getString("body");
         d.sourceLocation = ev.getString("sourceLocation");
         d.statusId = ev.getString("statusId");
         d.provenanceId = ev.getString("provenanceId");
+        d.kind = ev.getString("kind");
         String riskId = ev.getString("riskId");
         if ("LskReversible".equals(riskId)) d.risk = "reversible";
         else if ("LskIrreversible".equals(riskId)) d.risk = "irreversible";
@@ -398,6 +525,7 @@ public class SkillIndex {
                     .set("name", doc.name)
                     .set("title", doc.title)
                     .set("description", doc.description)
+                    .set("summary", doc.summary != null && !doc.summary.isBlank() ? doc.summary.trim() : null)
                     .set("body", doc.body != null && !doc.body.isEmpty() ? doc.body : rawBody)
                     .set("riskId", riskId(doc.risk))
                     .set("statusId", "LsksProposed")
@@ -407,11 +535,23 @@ public class SkillIndex {
                     .set("worldSuccessCount", 0)
                     .set("simSuccessCount", 0);
             ev.setSequencedIdPrimary();
-            return ev.create();
+            try {
+                return ev.create();
+            } catch (org.moqui.entity.EntityException e) {
+                // Two sims proposing the same name at once: the unique index on name lets one win. Use the winner's row.
+                EntityValue winner = ec.getEntity().find("moqui.llm.LlmSkill")
+                        .condition("name", doc.name.trim()).useCache(false).one();
+                if (winner != null) return winner;
+                throw e;
+            }
         });
     }
 
-    /** Promote a sim-proposed skill after a successful world act. */
+    /**
+     * Count a successful world act for a sim-proposed skill. The skill stays Proposed, which keeps it out of
+     * every other user's prompt and search, until a person activates it. Setting the llm_skill_auto_admit
+     * property or environment variable to true restores automatic promotion for trusted single-tenant setups.
+     */
     public static EntityValue admitWorldPass(ExecutionContext ec, String skillName) {
         if (ec == null || skillName == null || skillName.isEmpty()) return null;
         return withAuthzDisabled(ec, () -> {
@@ -421,7 +561,8 @@ public class SkillIndex {
             Object worldObj = sk.get("worldSuccessCount");
             long world = worldObj instanceof Number ? ((Number) worldObj).longValue() : 0L;
             sk.set("worldSuccessCount", world + 1L);
-            if ("LsksProposed".equals(sk.getString("statusId"))) {
+            if ("LsksProposed".equals(sk.getString("statusId"))
+                    && "true".equals(org.moqui.util.SystemBinding.getPropOrEnv("llm_skill_auto_admit"))) {
                 sk.set("statusId", "LsksActive");
                 if ("LskpSim".equals(sk.getString("provenanceId")) || "LskpInfer".equals(sk.getString("provenanceId")))
                     sk.set("provenanceId", "LskpMixed");
@@ -482,9 +623,10 @@ public class SkillIndex {
                     EntityValue lesson = ec.getEntity().makeValue("moqui.llm.LlmLesson")
                             .set("skillId", sk.get("skillId"))
                             .set("title", title)
-                            .set("body", cap(lessonBody, 800))
+                            .set("body", lessonBody.trim())
                             .set("provenanceId", "sim".equals(contact) ? "LskpSim" : "LskpWorld")
-                            .set("statusId", "LsksActive")
+                            // A model-written skill must not push text into every user's prompt unreviewed
+                            .set("statusId", "LskpHuman".equals(sk.getString("provenanceId")) ? "LsksActive" : "LsksProposed")
                             .set("createdDate", ec.getUser().getNowTimestamp());
                     lesson.setSequencedIdPrimary();
                     lesson.create();
@@ -512,7 +654,7 @@ public class SkillIndex {
         }
     }
 
-    static List<String> lessonLines(ExecutionContext ec, String skillId) {
+    public static List<String> lessonLines(ExecutionContext ec, String skillId) {
         if (ec == null || skillId == null || skillId.isBlank()) return Collections.emptyList();
         try {
             return withAuthzDisabled(ec, () -> {
@@ -523,7 +665,11 @@ public class SkillIndex {
                 int size = list.size();
                 for (int i = 0; i < size; i++) {
                     String body = list.get(i).getString("body");
-                    if (body != null && !body.isBlank()) lines.add(cap(body.trim(), 400));
+                    if (body != null && !body.isBlank()) {
+                        String text = body.trim();
+                        warnIfLarge("lesson " + skillId, text);
+                        lines.add(text);
+                    }
                 }
                 return lines;
             });
@@ -566,7 +712,7 @@ public class SkillIndex {
     }
 
     /**
-     * LlmServlet is not a screen, so inheritAuthz from ASSIST_APP does not cover these rows.
+     * LlmServlet is not a screen, so screen inheritAuthz does not cover these rows.
      * Same pattern as {@code LlmConversationImpl} persist.
      */
     static <T> T withAuthzDisabled(ExecutionContext ec, Supplier<T> work) {

@@ -25,6 +25,9 @@ def result = ec.llm.getDefault()
 
 - OpenAI-compatible protocol (`/v1/chat/completions`) for OpenAI, Azure OpenAI, Ollama, and other compatible
   servers. Sync `call()` and streaming `stream(LlmStreamListener)` via RestClient.streamSse.
+  An opt-in Responses protocol (`org.moqui.impl.llm.OpenAiResponsesProtocol`, `/v1/responses`) serves OpenAI
+  and xAI with `store` forced off; reasoning items are replayed from the conversation. Chat Completions replays
+  `reasoning_content` and tool-call fields such as a Gemini thought signature so a later tool turn is accepted.
 - Conversations persist as `LlmConversation` / `LlmMessage` / `LlmCallLog`. History is durable; the prompt window
   is a view of it. `injectContext` is untrusted CONTEXT, never SYSTEM.
 - Artifact type `AT_LLM` (authz and tarpit enabled). Seed grants ADMIN `AUTHZT_ALWAYS` on group `LlmProfiles`
@@ -135,15 +138,50 @@ Other production notes:
 - `write_ui` on the servlet requires profile `allow-write-ui="true"`. Client `tools` may only subset
   `{request, write_ui, browse, run_service}`. POST `/llm/v1/chat` may pass `extraBody` (merged into the
   provider JSON) for vendor knobs such as Qwen `chat_template_kwargs` / `tool_choice`.
-- Purge old rows with `org.moqui.impl.LlmServices.clean#LlmData` (`daysToKeep` default 90). Schedule a
-  ServiceJob like `clean_ArtifactData_daily`.
+- Purge old rows with `org.moqui.impl.LlmServices.clean#LlmData`. `daysToKeep` (default 90) deletes conversations,
+  messages and call logs; `contentDaysToKeep` (default 14, 0 skips it) clears only the stored prompt and response text
+  of older call logs and keeps the row. The `clean_LlmData_daily` ServiceJob is in the seed-initial data, active, 2 AM
+  nightly.
+- System app: System > LLM has conversations (with messages, provider calls, skill use and state), calls, daily usage,
+  skills (review queue, edit, approve, supersede, lessons), a retrieval test, and a read-only view of each profile
+  with a connection test. All of it is ADMIN access like the rest of the System app. Conversation detail and call
+  detail show full prompts and responses when the profile has `log-content="true"`.
+- Skills a sim proposes stay Proposed until a person approves them in System > LLM > Skills. Only human-approved skills
+  can set `risk: reversible` to skip the confirmation click. Set the `llm_skill_auto_admit` property or environment
+  variable to `true` to promote a sim skill automatically after one successful write (single-tenant setups only).
+- Generated Vue screens (`write_ui` kind `vue-sfc`, `allow-vue-sfc`, off by default) run in a sandboxed frame with an opaque
+  origin and a CSP with no network, so they cannot use the session, cookies, storage or the CSRF token, and the only way out
+  is a validated message channel. Generated code reads data with `this.$bridge.get(path, query)`, which goes to the read-only
+  `GET /llm/v1/read` endpoint. That endpoint runs the profile's `request` tool as the user and refuses a path that would
+  change data. Code that uses `fetch`, `$.ajax`, `this.$root`, the CSRF token or an `m-*` widget other than `m-text-line`,
+  `m-drop-down`, `m-date-time`, `m-display`, `m-date-period` and `m-container-box` reports an error. Writes happen only
+  through the canvas actions the page runs from a click. See
+  `runtime/base-component/webroot/screen/webroot/js/assist/README_SANDBOX.txt`.
+- Turn lease: `LlmConversation.turnOwner` and `turnLeaseThru` make single-flight hold across several Moqui nodes. The
+  node running a turn renews its lease every 20 seconds (90 second lease). Another node takes a Streaming conversation
+  over only after the lease runs out. Cancel is also noticed across nodes, by polling the stored status. Node clocks
+  should agree to within a few seconds, which clustered deployments already need.
+- Sim (`TransactionCacheDb`): if a transaction that wrote to the sim rolls back, the sim is terminated with
+  `SimTerminatedException` and the agent is told to start a new one. A failure before any write (a validation error) does
+  not end the sim. `EntityFacade.getConnection(...)` is refused in a sim session, because a JDBC connection bypasses the
+  overlay. Aggregate view entities are answered from production until the sim changes one of their member entities, then
+  from a full copy of the members.
 - Browser clients: `fetch` POST + `ReadableStream`, not `EventSource` (`EventSource` is GET-only and cannot
   send JSON, CSRF, or Authorization). CSRF on servlet POST (`X-CSRF-Token` / `moquiSessionToken`) unless
   `moqui.request.authenticated` (successful Basic / `login_key`).
 - `/cancel` while Streaming or Yielded returns 200 and aborts the in-flight RestStream; other statuses 409.
   `POST /chat` or `/resume` while Streaming is 409 (Yielded must resume). SSE pings every
   `sse-ping-seconds` (default 15).
-- Blank `api-key` omits auth. RestClient redacts `Authorization`, `api-key`, and `x-api-key` on LLM calls.
+- Credential-looking query parameters (key, token, secret, sig, auth, password) and header names (including `Authorization`, `api-key` and `x-api-key`) are masked in RestClient
+  logs and exception messages, and logged error bodies are capped at 2000 characters.
+- **RestClient behavior change:** a response's `headers()` is still a map from header name to a list of values, but each
+  list element is now one received header line exactly as sent (Jetty `HttpField.getValue()`), where it used to be
+  that line cut apart on commas (`getValues()`). A header whose value contains commas, such as `Set-Cookie` with an
+  `Expires` date or a `Date`, was previously split into pieces that no longer meant anything. Code that reads a
+  header sent as one comma-separated line and expects separate elements must now split it itself.
+- The web libraries fetched by `runtime/base-component/webroot/build.gradle` are now downloaded over https and checked
+  against SHA-256 values in `libChecksums`. A mismatch fails the build. Update the matching entry when you change a
+  library version.
 
 ## Release 4.0.1 - Not Yet Released
 

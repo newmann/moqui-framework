@@ -18,10 +18,13 @@ import org.moqui.impl.llm.LlmClientImpl
 import org.moqui.impl.llm.LlmConversationImpl
 import org.moqui.impl.llm.LlmFacadeImpl
 import org.moqui.impl.llm.LlmGateway
+import org.moqui.impl.llm.tools.BrowseTool
+import org.moqui.impl.llm.tools.ScreenUseTool
 import org.moqui.impl.webapp.SseSink
 import org.moqui.impl.webapp.ServletStreamListener
 import org.moqui.llm.LlmException
 import org.moqui.llm.LlmMessage
+import org.moqui.llm.LlmProtocol.ProtocolRequest
 import org.moqui.llm.LlmTool
 import org.moqui.llm.LlmToolCall
 import org.moqui.llm.LlmToolResult
@@ -43,7 +46,11 @@ class LlmServletTests extends Specification {
         LlmGateway.parseRoute("/v1/conversations/100").op == LlmGateway.Route.Op.GET_CONVERSATION
         LlmGateway.parseRoute("/v1/conversations/100", "DELETE").op == LlmGateway.Route.Op.DELETE_CONVERSATION
         LlmGateway.parseRoute("/v1/conversations/100", "DELETE").conversationId == "100"
+        LlmGateway.parseRoute("/v1/conversations/100", "POST").op == LlmGateway.Route.Op.UPDATE_CONVERSATION
+        LlmGateway.parseRoute("/v1/conversations/100", "POST").conversationId == "100"
+        LlmGateway.parseRoute("/v1/conversations/100", "POST").isPost()
         LlmGateway.parseRoute("/v1/conversations/100", "GET").op == LlmGateway.Route.Op.GET_CONVERSATION
+        LlmGateway.parseRoute("/v1/conversations/100").op == LlmGateway.Route.Op.GET_CONVERSATION
         LlmGateway.parseRoute("/v1/conversations").op == LlmGateway.Route.Op.LIST_CONVERSATIONS
         LlmGateway.parseRoute("/v1/profiles").op == LlmGateway.Route.Op.GET_PROFILES
         LlmGateway.parseRoute("/v1/chat").isPost()
@@ -119,11 +126,52 @@ class LlmServletTests extends Specification {
         LlmGateway.parseTools(["request", "write-ui"]) == ["request", "write_ui"]
         LlmGateway.parseTools(["browse", "run-service"]).containsAll(["browse", "run_service"])
         LlmGateway.parseTools(["find_basic"]) == ["find_basic"]
+        LlmGateway.parseTools(["screen_use"]) == ["screen_use"]
         when:
         LlmGateway.parseTools(["request", "clean_llm"])
         then:
         LlmException e = thrown()
         e.httpStatus == 400
+    }
+
+    def "screen_use submit allows a link and a read-only GET and a bad path does not yield"() {
+        expect:
+        ScreenUseTool.submitAllowed("m-form-link", "POST", false)
+        ScreenUseTool.submitAllowed("m-form", "GET", true)
+        !ScreenUseTool.submitAllowed("m-form", "GET", false)
+        !ScreenUseTool.submitAllowed("m-form", "POST", true)
+        !ScreenUseTool.submitAllowed("m-form", "POST", false)
+        new ScreenUseTool().enrichForClient([action: "watch"], null).until == "either"
+        new ScreenUseTool().enrichForClient([action: "watch", until: "forever"], null).error == "bad_until"
+        def ctx = ScreenUseTool.contextText([path: "/qapps/test/Order/FindOrder", title: "Find Order",
+                parameters: [customerPartyId: "1", password: "secret"]])
+        ctx.contains("/qapps/test/Order/FindOrder")
+        ctx.contains("***")
+        !ctx.contains("secret")
+
+        when:
+        def proto = new FakeLlmProtocol()
+        proto.handler = { ProtocolRequest req ->
+            def tools = req?.window?.findAll { it.role == LlmMessage.Role.TOOL }
+            def last = tools ? tools[-1] : null
+            if (last?.name == "screen_use") return FakeLlmProtocol.stop("stopped")
+            return FakeLlmProtocol.toolCalls(new LlmToolCall("s1", "screen_use",
+                    '{"action":"navigate","path":"https://evil.example/qapps"}'))
+        }
+        def profile = LlmFacadeImpl.ProfileState.forTest("default", proto, "m", false, 2, 0f, 5)
+        def client = new LlmClientImpl(null, profile, { false })
+        client.allowClientTools(true)
+        client.maxIterations(6)
+        client.tool(LlmTool.screenUse())
+        def r = client.user("go").call()
+
+        then:
+        !r.yielded
+        r.content == "stopped"
+        def hit = r.toolResults.find { it.name == "screen_use" }
+        hit != null
+        hit.content instanceof Map
+        ((Map) hit.content).error != null
     }
 
     def "attachServletTools skips request when profile has no allowed-path"() {
@@ -206,7 +254,7 @@ class LlmServletTests extends Specification {
 
     def "browse roots work without ExecutionContext"() {
         when:
-        def out = (Map) new org.moqui.impl.llm.BrowseTool().execute([path: "/"], null)
+        def out = (Map) new BrowseTool().execute([path: "/"], null)
         then:
         out.path == "/"
         out.children.find { it.name == "qapps" }
@@ -217,7 +265,7 @@ class LlmServletTests extends Specification {
 
     def "browse invalid regex is a tool error not an exception"() {
         when:
-        def out = (Map) new org.moqui.impl.llm.BrowseTool().execute([path: "/", match: "("], null)
+        def out = (Map) new BrowseTool().execute([path: "/", match: "("], null)
         then:
         out.error
         out.error.toString().toLowerCase().contains("regex")

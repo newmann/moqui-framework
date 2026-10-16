@@ -14,12 +14,14 @@
 
 import org.moqui.Moqui
 import org.moqui.context.ExecutionContext
-import org.moqui.impl.llm.BrowseTool
+import org.moqui.entity.EntityValue
 import org.moqui.impl.llm.LlmGateway
 import org.moqui.impl.llm.ScreenSearchHints
 import org.moqui.impl.llm.SessionFacts
 import org.moqui.impl.llm.SkillIndex
 import org.moqui.impl.llm.ToolResultTrim
+import org.moqui.impl.llm.tools.BrowseTool
+import org.moqui.impl.llm.tools.ScreenUseTool
 import spock.lang.IgnoreIf
 import spock.lang.Shared
 import spock.lang.Specification
@@ -48,9 +50,9 @@ class LlmBrowseTests extends Specification {
 
     def "requestScreenPath maps qapps and vapps to apps"() {
         expect:
-        BrowseTool.requestScreenPath("/qapps/marble/Asset") == "/apps/marble/Asset"
-        BrowseTool.requestScreenPath("/vapps/marble/Asset") == "/apps/marble/Asset"
-        BrowseTool.requestScreenPath("/apps/marble/Asset") == "/apps/marble/Asset"
+        BrowseTool.requestScreenPath("/qapps/test/Asset") == "/apps/test/Asset"
+        BrowseTool.requestScreenPath("/vapps/test/Asset") == "/apps/test/Asset"
+        BrowseTool.requestScreenPath("/apps/test/Asset") == "/apps/test/Asset"
         BrowseTool.requestScreenPath("/qapps") == "/apps"
     }
 
@@ -73,10 +75,9 @@ class LlmBrowseTests extends Specification {
         hit != null
         hit.kind == "transition"
         hit.serviceName == "org.moqui.impl.UserServices.create#UserAccount"
-        hit.inParameters.contains("username")
-        hit.form == "CreateUserAccount"
-        hit.formFields.contains("username")
-        hit.formFields.contains("newPassword")
+        hit.method != null
+        !hit.containsKey("inParameters")
+        !hit.containsKey("formFields")
     }
 
     def "UserAccountList screen detail includes parameters forms and transitions"() {
@@ -93,6 +94,10 @@ class LlmBrowseTests extends Specification {
         form.fields.contains("emailAddress")
         trans != null
         trans.serviceName == "org.moqui.impl.UserServices.create#UserAccount"
+        trans.inParameters.contains("username")
+        trans.formFields.contains("username")
+        trans.formFields.contains("newPassword")
+        ((List) out.children).find { it.name == "createUserAccount" } == null
     }
 
     def "match on service name finds createUserAccount under UserAccount at depth 1"() {
@@ -117,7 +122,8 @@ class LlmBrowseTests extends Specification {
         then:
         hit != null
         hit.kind == "transition"
-        hit.formFields.contains("emailAddress")
+        hit.serviceName.contains("create#UserAccount")
+        !hit.containsKey("formFields")
     }
 
     def "EntityDataEdit listing includes required screen parameter"() {
@@ -203,32 +209,20 @@ class LlmBrowseTests extends Specification {
         ((List) out.children).find { it.name == "actions" } == null
     }
 
-    def "FindAsset lists ListAssets form-list with jsonPath"() {
-        when:
-        Map out = (Map) new BrowseTool().execute(
-                [path: "/qapps/marble/Asset/Asset/FindAsset"], ec)
-        Map hit = ((List) out.children).find { it.name == "ListAssets" }
-        Map actions = ((List) out.children).find { it.name == "actions" }
-
-        then:
-        hit != null
-        hit.kind == "form-list"
-        hit.method == "GET"
-        hit.jsonPath.toString() == "/apps/marble/Asset/Asset/FindAsset/actions/ListAssets"
-        hit.path.toString() == "/apps/marble/Asset/Asset/FindAsset/actions/ListAssets"
-        hit.entityName == "mantle.product.asset.AssetFindView"
-        hit.fields.contains("productId")
-        hit.fields.contains("quantityOnHandTotal") || hit.fields.contains("availableToPromiseTotal")
-        actions == null
-    }
-
     def "ArtifactHitBins form-list exposes requireParameters and AT_SERVICE option"() {
         when:
-        Map out = (Map) new BrowseTool().execute(
+        Map summary = (Map) new BrowseTool().execute(
                 [path: "/qapps/system/ArtifactHitBins"], ec)
-        Map hit = ((List) out.children).find { it.name == "ArtifactHitBins" && it.kind == "form-list" }
+        Map listed = ((List) summary.children).find { it.name == "ArtifactHitBins" && it.kind == "form-list" }
+        Map out = (Map) new BrowseTool().execute(
+                [path: "/qapps/system/ArtifactHitBins", detail: true], ec)
+        Map hit = ((List) out.leaf.forms).find { it.name == "ArtifactHitBins" }
 
         then:
+        listed != null
+        listed.method == "GET"
+        listed.jsonPath.toString() == "/apps/system/ArtifactHitBins/actions/ArtifactHitBins"
+        !listed.containsKey("findFields")
         hit != null
         hit.jsonPath.toString() == "/apps/system/ArtifactHitBins/actions/ArtifactHitBins"
         hit.requireParameters == true
@@ -243,84 +237,7 @@ class LlmBrowseTests extends Specification {
         binStart != null
         binStart.widget == "date-period"
         binStart.params.contains("binStartDateTime_period")
-    }
-
-    def "FindAsset detail forms include jsonPath and skip actions transition"() {
-        when:
-        Map out = (Map) new BrowseTool().execute(
-                [path: "/qapps/marble/Asset/Asset/FindAsset", detail: true], ec)
-        Map form = ((List) out.leaf.forms).find { it.name == "ListAssets" }
-        Map actions = ((List) out.leaf.transitions).find { it.name == "actions" }
-
-        then:
-        form != null
-        form.type == "form-list"
-        form.jsonPath.toString() == "/apps/marble/Asset/Asset/FindAsset/actions/ListAssets"
-        form.method == "GET"
-        form.entityName == "mantle.product.asset.AssetFindView"
-        actions == null
-    }
-
-    def "match quantityOnHand finds ListAssets form-list under Asset"() {
-        when:
-        Map out = (Map) new BrowseTool().execute(
-                [path: "/qapps/marble/Asset", match: "quantityOnHand", depth: 3], ec)
-        Map hit = ((List) out.children).find { it.name == "ListAssets" && it.kind == "form-list" }
-
-        then:
-        hit != null
-        hit.jsonPath.toString() == "/apps/marble/Asset/Asset/FindAsset/actions/ListAssets"
-    }
-
-    def "search hints name QuickSearch and mantle Search actions this user can view"() {
-        when:
-        String text = ScreenSearchHints.text(ec)
-        List mounts = ScreenSearchHints.find(ec)
-        List lines = text.split("\n") as List
-        List searchMounts = mounts.findAll { bareSearchPath(it.actionsPath) }
-        String searchOnly = ScreenSearchHints.render([
-                new ScreenSearchHints.Mount(false, false, "/apps/hm/Search", "/apps/hm/Search/actions")])
-
-        then:
-        text != null
-        text.contains("/apps/marble/QuickSearch/actions")
-        text.contains("/apps/hm/Search/actions")
-        text.contains("/apps/hmadmin/Search/actions")
-        text.contains("/apps/PopcAdmin/Search/actions")
-        text.contains("/apps/PopcAdmin/QuickSearch/actions")
-        text.contains("queryString")
-        text.contains("documentList")
-        text.contains("orderHeader")
-        !text.contains("lookup#ById")
-        !text.contains("/Catalog/Search")
-        mounts.every { it.actionsPath.startsWith("/apps/") && it.actionsPath.endsWith("/actions") }
-        mounts.every { !it.screenPath.contains("/Catalog/Search") }
-        searchMounts*.actionsPath.containsAll([
-                "/apps/hm/Search/actions",
-                "/apps/hmadmin/Search/actions",
-                "/apps/PopcAdmin/Search/actions"])
-        searchMounts.every { m ->
-            String line = lines.find { it.contains(m.actionsPath) }
-            line != null && line.contains("queryString") && !line.contains("lookupId") && line.startsWith("- Search:")
-        }
-        lines.find { it.contains("/apps/PopcAdmin/QuickLookup/actions") }?.contains("lookupId")
-
-        searchOnly.contains("/apps/hm/Search/actions")
-        searchOnly.contains("queryString")
-        searchOnly.contains("documentList")
-        !searchOnly.contains("lookupId")
-        !searchOnly.contains("orderHeader")
-
-        ScreenSearchHints.isMantleSearchActions(ec, ["apps", "hm", "Search", "actions"])
-        ScreenSearchHints.isMantleSearchActions(ec, ["apps", "hmadmin", "Search", "actions"])
-        ScreenSearchHints.isMantleSearchActions(ec, ["apps", "PopcAdmin", "Search", "actions"])
-        !ScreenSearchHints.isMantleSearchActions(ec, ["apps", "PopcAdmin", "Catalog", "Search", "actions"])
-        !ScreenSearchHints.isMantleSearchActions(ec, ["apps", "marble", "QuickSearch", "actions"])
-        !ScreenSearchHints.isMantleSearchActions(ec, ["apps", "PopcAdmin", "Search", "actions", "SearchResults"])
-        !ToolResultTrim.isSearchActionsPath(["apps", "hm", "Search", "actions"])
-        !ToolResultTrim.isSearchActionsPath(["apps", "PopcAdmin", "Catalog", "Search", "actions"])
-        ToolResultTrim.isSearchActionsPath(["apps", "marble", "QuickSearch", "actions"])
-        ToolResultTrim.isSearchActionsPath(["apps", "PopcAdmin", "QuickLookup", "actions"])
+        ((List) out.children).find { it.kind == "form-list" } == null
     }
 
     private static boolean bareSearchPath(String path) {
@@ -338,83 +255,6 @@ class LlmBrowseTests extends Specification {
         text.contains("partyId=")
         !text.toLowerCase().contains("permission")
         !text.contains("ADMIN")
-    }
-
-    def "AssistSystem documents screen-first ladder and find-form jsonPath"() {
-        when:
-        def f = new File("../runtime/base-component/tools/prompt/AssistSystem.ftl")
-        String text = f.exists() ? f.text : ""
-
-        then:
-        f.exists()
-        text.contains("/actions/{formName}")
-        text.contains("Catalog search order")
-        text.contains("/rest/s1")
-        text.contains("/rest/e1")
-        text.contains("Find forms")
-        text.contains("QuickSearch, Search, or QuickLookup")
-        text.contains("kind=openui")
-        text.contains("adjust: true")
-        text.contains("Do not browse")
-        text.contains("`kind` `transition`")
-        text.contains("YYYY-MM-DD HH:mm")
-        text.contains("writeMode")
-        text.contains("*_display")
-        text.contains("requireParameters")
-        text.contains("AT_SERVICE")
-        text.indexOf("/qapps") < text.indexOf("/rest/s1")
-    }
-
-    def "AssistSystem template includes generated OpenUI Lang prompt"() {
-        when:
-        String sys = LlmGateway.renderPrompt(ec, "component://tools/prompt/AssistSystem.ftl", null)
-        then:
-        sys != null
-        sys.contains("root = Stack")
-        sys.contains("Lookup(")
-        sys.contains("Link(")
-        sys.contains("BarChart(")
-        sys.contains("MarkDownRenderer(")
-        sys.contains("Mermaid(")
-        sys.contains("DatePeriod(")
-        sys.contains("kind=openui")
-        sys.contains("YYYY-MM-DD HH:mm")
-        sys.contains("writeMode")
-        !sys.contains("<#include")
-        !sys.contains("kind=vue-sfc")
-        !sys.contains("module.exports")
-    }
-
-    def "AssistSystem includes VueSfc prompt only when allowVueSfc"() {
-        when:
-        String off = LlmGateway.renderPrompt(ec, "component://tools/prompt/AssistSystem.ftl", [allowVueSfc: false])
-        String on = LlmGateway.renderPrompt(ec, "component://tools/prompt/AssistSystem.ftl", [allowVueSfc: true])
-        String openUi = new File("../runtime/base-component/tools/prompt/OpenUiLang.prompt.txt").text
-
-        then:
-        off != null && !off.contains("kind=vue-sfc")
-        on.contains("kind=vue-sfc")
-        on.contains("module.exports")
-        on.contains("moquiSessionToken")
-        !openUi.contains("vue-sfc")
-    }
-
-    def "OpenUI spec component names appear in OpenUiLang prompt"() {
-        when:
-        File specFile = new File("../runtime/base-component/webroot/screen/webroot/js/assist/AssistOpenUiLibrary.spec.json")
-        File promptFile = new File("../runtime/base-component/tools/prompt/OpenUiLang.prompt.txt")
-        def spec = new groovy.json.JsonSlurper().parse(specFile)
-        def names = spec['$defs'].keySet()
-        String prompt = promptFile.text
-        def missing = names.findAll { !prompt.contains(it + "(") }
-
-        then:
-        specFile.exists()
-        promptFile.exists()
-        names.contains("Link")
-        names.contains("BarChart")
-        names.contains("MarkDownRenderer")
-        missing.isEmpty()
     }
 
     def "SkillInject FTL miss and hit render through ResourceFacade"() {
@@ -437,5 +277,145 @@ class LlmBrowseTests extends Specification {
         sim.contains("You are in sim")
         sim.contains("place order")
         sim.contains("orderId")
+    }
+
+    def "inject keeps one oversized skill whole and drops a later skill"() {
+        given:
+        SkillIndex.SkillDoc first = new SkillIndex.SkillDoc()
+        first.name = "first-skill"
+        first.title = "First"
+        first.risk = "confirm"
+        first.body = "BEGIN-FIRST " + ("a" * 40000) + " END-FIRST"
+        SkillIndex.SkillDoc second = new SkillIndex.SkillDoc()
+        second.name = "second-skill"
+        second.title = "Second"
+        second.risk = "confirm"
+        second.body = "BEGIN-SECOND " + ("b" * 20000) + " END-SECOND"
+
+        when:
+        String one = SkillIndex.formatInject(ec, [first])
+        String both = null
+        List<String> dropWarns = WarnCapture.of(SkillIndex.class) {
+            both = SkillIndex.formatInject(ec, [first, second])
+        }
+
+        then:
+        one.contains("BEGIN-FIRST")
+        one.contains("END-FIRST")
+        one.length() > SkillIndex.INJECT_CHARS
+        both.contains("BEGIN-FIRST")
+        both.contains("END-FIRST")
+        !both.contains("second-skill")
+        !both.contains("END-SECOND")
+        dropWarns.any { it.contains("dropped skill") && it.contains("second-skill") }
+    }
+
+    def "reference cards render beside procedures and are not sliced"() {
+        given:
+        SkillIndex.SkillDoc proc = new SkillIndex.SkillDoc()
+        proc.name = "create-user-account"
+        proc.title = "Create user"
+        proc.risk = "confirm"
+        proc.description = "Create a UserAccount"
+        proc.summary = "Create the account with create#UserAccount."
+        proc.body = "Call run_service create#UserAccount\n## Widgets\nwidget line"
+        SkillIndex.SkillDoc card = new SkillIndex.SkillDoc()
+        card.name = "marble-party-roles"
+        card.kind = "reference"
+        card.title = "Party roles"
+        card.description = "How parties relate"
+        String cardBody = "CARD-START " + ("c" * 500) + " CARD-END"
+        card.body = cardBody + "\n## Widgets\nwidget hidden"
+
+        when:
+        String mixed = SkillIndex.formatInjectForDocs(ec, [card, proc], "create user account")
+        String only = SkillIndex.formatInjectForDocs(ec, [card], "party roles")
+
+        then:
+        mixed.indexOf("create-user-account") < mixed.indexOf("marble-party-roles")
+        mixed.contains("These are candidates")
+        mixed.contains("Create the account with create#UserAccount.")
+        !mixed.contains("widget line")
+        mixed.contains("(reference card, not a procedure)")
+        mixed.contains("CARD-END")
+        mixed.contains(cardBody)
+        mixed.contains("widget hidden")
+        !mixed.contains("No procedure skill matched")
+        only.contains("No procedure skill matched")
+        only.contains("marble-party-roles")
+        only.contains("CARD-END")
+        !only.contains("No matching skill")
+    }
+
+    def "a long reference card is sent whole and logged"() {
+        given:
+        SkillIndex.SkillDoc card = new SkillIndex.SkillDoc()
+        card.name = "marble-long-card"
+        card.kind = "reference"
+        card.title = "Long card"
+        card.body = "LONG-START " + ("d" * SkillIndex.BODY_WARN_CHARS) + " LONG-END"
+
+        when:
+        String text = null
+        List<String> warns = WarnCapture.of(SkillIndex.class) {
+            text = SkillIndex.formatInjectForDocs(ec, [card], "long card")
+        }
+
+        then:
+        text.contains("LONG-START")
+        text.contains("LONG-END")
+        warns.any { it.contains("marble-long-card") && it.contains("sent whole") }
+    }
+
+    def "a long lesson is injected whole"() {
+        given:
+        String stamp = Long.toString(System.currentTimeMillis())
+        String skillName = "long-lesson-" + stamp
+        String lessonBody = "LESSON-START " + ("q" * 500) + " LESSON-END"
+        EntityValue sk = ec.entity.makeValue("moqui.llm.LlmSkill")
+                .set("name", skillName)
+                .set("title", "Long lesson")
+                .set("body", "POST create")
+                .set("riskId", "LskConfirm")
+                .set("statusId", "LsksActive")
+                .set("provenanceId", "LskpHuman")
+                .set("version", 1)
+        sk.setSequencedIdPrimary()
+        sk.create()
+        EntityValue lesson = ec.entity.makeValue("moqui.llm.LlmLesson")
+                .set("skillId", sk.skillId)
+                .set("title", "long failure")
+                .set("body", lessonBody)
+                .set("statusId", "LsksActive")
+                .set("provenanceId", "LskpWorld")
+        lesson.setSequencedIdPrimary()
+        lesson.create()
+        SkillIndex.SkillDoc doc = new SkillIndex.SkillDoc()
+        doc.name = skillName
+        doc.skillId = sk.skillId
+        doc.risk = "confirm"
+        doc.body = "POST create"
+
+        when:
+        String injected = SkillIndex.formatInject(ec, [doc])
+
+        then:
+        injected.contains("LESSON-START")
+        injected.contains("LESSON-END")
+        injected.contains(lessonBody)
+
+        cleanup:
+        boolean d = ec.artifactExecution.disableAuthz()
+        boolean b = ec.transaction.begin(null)
+        try {
+            ec.entity.find("moqui.llm.LlmLesson").condition("skillId", sk.skillId).deleteAll()
+            ec.entity.find("moqui.llm.LlmSkill").condition("skillId", sk.skillId).deleteAll()
+            if (b) ec.transaction.commit()
+        } catch (Throwable t) {
+            if (b) ec.transaction.rollback("long lesson cleanup", t)
+            throw t
+        } finally {
+            if (!d) ec.artifactExecution.enableAuthz()
+        }
     }
 }

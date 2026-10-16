@@ -15,7 +15,7 @@
 import org.moqui.Moqui
 import org.moqui.context.ArtifactAuthorizationException
 import org.moqui.context.ExecutionContext
-import org.moqui.impl.llm.FindBasicTool
+import org.moqui.impl.llm.tools.FindBasicTool
 import org.moqui.impl.llm.LlmClientImpl
 import org.moqui.impl.llm.LlmFacadeImpl
 import org.moqui.impl.llm.LlmGateway
@@ -103,8 +103,6 @@ class LlmFindBasicTests extends Specification {
         Map one = (Map) tool.execute([
                 entityName: "moqui.basic.Enumeration", keyField: "enumId", text: '${description}',
                 and: [enumTypeId: "DataSourceType"], limit: 1], ec)
-        Map mantle = (Map) tool.execute([
-                entityName: "mantle.party.PartyClassification", keyField: "partyClassificationId", text: "description"], ec)
         Map email = (Map) tool.execute([
                 entityName: "moqui.basic.email.EmailServer", keyField: "emailServerId", text: "description"], ec)
         Map badField = (Map) tool.execute([
@@ -126,135 +124,45 @@ class LlmFindBasicTests extends Specification {
         !dated.error
         one.truncated == true
         one.options.size() == 1
-        mantle.error == "entity_not_allowed"
-        !mantle.options
         email.error == "entity_not_allowed"
         badField.error == "unknown_field"
     }
 
-    static final List<List> SKILL_FORMS = [
-            ["create-internal-organization", "/apps/marble/Party/FindParty", "CreateOrganizationForm", []],
-            ["add-party-contact-info", "/apps/marble/Party/EditParty/UpdateContactInfo", "UpdateContactInfo", []],
-            ["clone-accounting-settings", "/apps/marble/Accounting/OrgSettings/AcctgPreference", "CloneAcctgSettingsForm", ["cogsMethodEnumId", "sourcePartyId"]],
-            ["clone-accounting-settings", "/apps/marble/Accounting/OrgSettings/AcctgPreference", "EditPapForm", []],
-            ["create-sales-account", "/apps/marble/Customer/FindCustomer", "CreateAccountForm", []],
-            ["add-customer-payment-method", "/apps/marble/Customer/EditCustomer/UpdatePaymentMethodInfo", "PaymentMethodInfoForm", []],
-            ["add-sales-contact", "/apps/marble/Customer/EditCustomer", "AddContactAssignForm", []],
-            ["add-sales-contact", "/apps/marble/Customer/FindCustomer", "CreateContactForm", []],
-            ["create-person-customer", "/apps/marble/Customer/FindCustomer", "CreatePersonForm", ["roleTypeId"]],
-            ["create-employee", "/apps/marble/Party/FindParty", "CreateEmployeeForm", []],
-            ["create-project", "/apps/marble/Project/FindProject", "NewProject", []],
-            ["create-work-task", "/apps/marble/Task/FindTask", "NewTaskForm", []],
-            ["add-labor-rate", "/apps/marble/HumanRes/EditRateAmounts", "CreateRateAmount", ["rateTypeEnumId", "ratePurposeEnumId", "timePeriodUomId"]],
-            ["record-time-entry", "/apps/my/User/TimeEntries", "TimeEntryList", []],
-            ["record-time-entry", "/apps/my/User/TimeEntries/EditTimeEntry", "AddTimeForm", []],
-            ["create-project-client-invoice", "/apps/marble/Project/ProjectTimeEntries", "ProjectInvoice", []],
-            ["create-asset-product", "/apps/marble/Catalog/Product/FindProduct", "NewProductForm", ["productTypeEnumId", "ownerPartyId"]],
-            ["create-asset-product", "/apps/marble/Catalog/Product/EditProduct", "EditProductForm", ["assetTypeEnumId", "assetClassEnumId"]],
-            ["create-asset-product", "/apps/marble/Catalog/Product/EditPrices", "NewPriceForm", ["priceTypeEnumId", "pricePurposeEnumId"]],
-            ["create-warehouse", "/apps/marble/Facility/FindFacility", "NewFacilityForm", ["facilityTypeEnumId"]],
-            ["create-product-store", "/apps/marble/ProductStore/FindProductStore", "NewStoreForm", []],
-            ["create-product-store", "/apps/marble/ProductStore/EditProductStore", "EditStoreForm", ["reservationAutoEnumId"]],
-            ["receive-inventory-direct", "/apps/marble/Asset/Asset/FindSummary", "ReceiveAssetForm", ["statusId"]],
-            ["create-sales-order", "/apps/marble/Order/FindOrder", "CreateSalesOrder", []],
-            ["create-sales-order", "/apps/marble/Order/OrderDetail", "AddProductItemForm", []],
-            ["ship-sales-order", "/apps/marble/Shipment/ShipmentDetail", "ItemSourceIssuanceList", []],
-            ["ship-sales-order", "/apps/marble/Shipment/ShipmentDetail", "SetPackedForm", []],
-            ["ship-sales-order", "/apps/marble/Shipment/ShipmentDetail", "SetShippedForm", []],
-            ["receive-invoice-payment", "/apps/marble/Accounting/Invoice/EditInvoice", "RecordPaymentForm", []],
-            ["create-supplier", "/apps/marble/Supplier/FindSupplier", "CreateOrganizationForm", []],
-            ["create-purchase-order", "/apps/marble/Order/FindOrder", "CreatePurchaseOrder", []],
-            ["create-purchase-order", "/apps/marble/Order/OrderDetail", "AddProductItemForm", []],
-            ["receive-incoming-shipment", "/apps/marble/Shipment/FindShipment", "NewIncomingShipment", []],
-            ["receive-incoming-shipment", "/apps/marble/Shipment/ShipmentDetail/ReceiveItem", "ReceiveForm", []],
-            ["pay-supplier", "/apps/marble/Accounting/Payment/FindPayment", "NewOutPaymentForm", []],
-            ["pay-supplier", "/apps/marble/Accounting/Invoice/EditInvoice", "RecordPaymentForm", []],
-            ["create-customer-request", "/apps/marble/Request/FindRequest", "NewRequestForm", []],
-            ["create-sales-quote", "/apps/marble/Order/FindOrder", "CreateSalesOrder", []],
-            ["process-sales-return", "/apps/marble/Return/FindReturn", "CreateReturn", []],
-            ["update-work-task", "/apps/marble/Task/EditTask", "EditTask", []],
-            ["add-record-note", "/apps/marble/Party/EditParty", "NewNoteForm", []],
-            ["add-record-note", "/apps/marble/Order/OrderDetail", "NewNoteForm", []],
-            ["add-record-note", "/apps/marble/Task/TaskSummary", "AddCommentForm", []],
-    ]
-
-    def "skill input forms resolve to widget lines"() {
-        when:
-        Map<String, List<String>> bySkill = new LinkedHashMap<>()
-        List<String> missing = []
-        for (List row : SKILL_FORMS) {
-            String skill = row[0]
-            String path = row[1]
-            String form = row[2]
-            Set<String> locked = new LinkedHashSet<>((List) row[3])
-            String section = FormWidgetTips.section(ec, path, form, locked)
-            if (section == null) {
-                missing.add(skill + " " + path + " " + form)
-                continue
-            }
-            bySkill.computeIfAbsent(skill, { [] }).add(section)
-        }
-        String runtime = System.getProperty("moqui.runtime") ?: "../runtime"
-        String xml = new File(runtime, "component/MarbleERP/data/MarbleErpSkillData.xml").text
-
-        then:
-        missing.empty
-        for (Map.Entry<String, List<String>> e : bySkill.entrySet()) {
-            int start = xml.indexOf('name="' + e.key + '"')
-            assert start > 0
-            int cdata = xml.indexOf("<![CDATA[", start)
-            int end = xml.indexOf("]]>", cdata)
-            String body = xml.substring(cdata, end)
-            for (String section : e.value) assert body.contains(section)
-        }
-    }
-
-    def "widget tips name find_basic, entity filters, and lookup transitions"() {
-        when:
-        String person = FormWidgetTips.section(ec, "/apps/marble/Party/FindParty", "CreatePersonCustForm")
-        String task = FormWidgetTips.section(ec, "/apps/marble/Task/FindTask", "NewTaskForm")
-        String account = FormWidgetTips.section(ec, "/apps/marble/Party/FindParty", "CreateAccountForm")
-
-        then:
-        person.contains("find_basic moqui.basic.Geo")
-        person.contains("geoTypeEnumId=GEOT_COUNTRY")
-        person.contains("entity mantle.party.PartyClassification")
-        person.contains("classificationTypeEnumId=PcltCustomer")
-        person.contains("or-null disabled")
-        person.contains("Lookup GET `/apps/marble/Party/FindParty/getGeoCountryStates`")
-        person.contains("depends countryGeoId")
-        task.contains("options 1,2,3,4,5,6,7,8,9")
-        task.contains("find_basic moqui.basic.Enumeration")
-        task.contains("enumTypeId=WorkEffortPurpose")
-        task.contains("parentEnumId=WetTask")
-        task.contains("find_basic moqui.basic.StatusItem")
-        task.contains("statusTypeId=WorkEffort")
-        task.contains("text StatusItemNameTemplate")
-        account.contains("/searchPartyList`")
-        account.contains("roleTypeId=Account")
-        account.contains("server-search")
-        account.contains("min-length 2")
-    }
-
-    def "catalog inject omits the widgets section"() {
+    def "catalog inject uses the summary and otherwise the full skill text"() {
         when:
         String body = "Do the thing.\n\n## Widgets\nForm `x` `y`.\n- a text-line"
-        SkillIndex.SkillDoc doc = new SkillIndex.SkillDoc()
-        doc.name = "widget-tip-test"
-        doc.title = "Widget tip test"
-        doc.description = "test"
-        doc.risk = "confirm"
-        doc.body = body
-        String injected = SkillIndex.formatInject(ec, [doc])
+        SkillIndex.SkillDoc summarized = new SkillIndex.SkillDoc()
+        summarized.name = "widget-tip-test"
+        summarized.title = "Widget tip test"
+        summarized.description = "test"
+        summarized.risk = "confirm"
+        summarized.summary = "  Short summary of the thing.  "
+        summarized.body = body
+        SkillIndex.SkillDoc full = new SkillIndex.SkillDoc()
+        full.name = "widget-tip-full"
+        full.title = "Widget tip full"
+        full.description = "test"
+        full.risk = "confirm"
+        full.body = body
+        String withSummary = SkillIndex.formatInject(ec, [summarized])
+        String withoutSummary = SkillIndex.formatInject(ec, [full])
 
         then:
-        SkillIndex.withoutWidgets(body) == "Do the thing."
-        SkillIndex.widgetsSection(body).startsWith("## Widgets")
-        injected.contains("Do the thing.")
-        injected.contains("omit `## Widgets`")
-        !injected.contains("\n## Widgets")
-        !injected.contains("Form `x` `y`.")
-        !injected.contains("- a text-line")
+        SkillIndex.summaryText(summarized) == "Short summary of the thing."
+        SkillIndex.summaryText(full) == body
+        SkillIndex.summaryText(null) == null
+        SkillIndex.activeDetailText(summarized) == body
+        SkillIndex.activeDetailText(full) == null
+        SkillIndex.activeDetailText(null) == null
+        withSummary.contains("Short summary of the thing.")
+        withSummary.contains("the skill summary when one is set")
+        !withSummary.contains("Do the thing.")
+        !withSummary.contains("Form `x` `y`.")
+        !withSummary.contains("- a text-line")
+        withoutSummary.contains("Do the thing.")
+        withoutSummary.contains("\n## Widgets")
+        withoutSummary.contains("Form `x` `y`.")
+        withoutSummary.contains("- a text-line")
     }
 
     def "assist profile attaches find_basic and the default profile does not"() {

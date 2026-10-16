@@ -18,6 +18,11 @@ import org.moqui.context.ArtifactExecutionFacade;
 import org.moqui.context.ArtifactExecutionInfo;
 import org.moqui.context.ArtifactTarpitException;
 import org.moqui.context.ExecutionContext;
+import org.moqui.impl.llm.tools.EnterSimTool;
+import org.moqui.impl.llm.tools.FindSkillTool;
+import org.moqui.impl.llm.tools.PinTool;
+import org.moqui.impl.llm.tools.RequestTool;
+import org.moqui.impl.llm.tools.WriteUiTool;
 import org.moqui.llm.LlmClient;
 import org.moqui.llm.LlmConversation;
 import org.moqui.llm.LlmException;
@@ -48,10 +53,10 @@ import java.util.function.BooleanSupplier;
 public class LlmClientImpl implements LlmClient {
     private static final Logger logger = LoggerFactory.getLogger(LlmClientImpl.class);
     static final int DEFAULT_MAX_ITERATIONS = 8;
-    static final int DEFAULT_TOOL_RESULT_MAX_CHARS = 8000;
+    static final int DEFAULT_TOOL_RESULT_MAX_CHARS = 65536;
 
     final ExecutionContext ec;
-    final LlmFacadeImpl.ProfileState profile;
+    public final LlmFacadeImpl.ProfileState profile;
     private final BooleanSupplier transactionInPlace;
 
     String systemContent = null;
@@ -62,7 +67,9 @@ public class LlmClientImpl implements LlmClient {
     private Integer maxTokens = null;
     private Integer timeoutSeconds = null;
     private Map<String, Object> extraBody = null;
-    LlmConversationImpl conversation = null;
+    /** low, medium, or high once resolved for this client. Null until ensureStoredReasoning. */
+    private String reasoningLevel = null;
+    public LlmConversationImpl conversation = null;
     private WindowPolicy windowPolicy = null;
     final List<LlmTool> tools = new ArrayList<>();
     final List<LlmToolResult> resumeToolResults = new ArrayList<>();
@@ -109,6 +116,7 @@ public class LlmClientImpl implements LlmClient {
             throw new LlmException("conversationId is required");
         this.conversation = LlmConversationImpl.load(ec, conversationId, true);
         applyWindowPolicyToConversation();
+        if (reasoningLevel != null) useReasoning(reasoningLevel, true);
         return this;
     }
     @Override
@@ -123,11 +131,15 @@ public class LlmClientImpl implements LlmClient {
             this.conversation = LlmConversationImpl.load(ec, conversation.getConversationId(), true);
         }
         applyWindowPolicyToConversation();
+        if (reasoningLevel != null) useReasoning(reasoningLevel, true);
         return this;
     }
     @Override
     public LlmClient newConversation() {
-        this.conversation = LlmConversationImpl.create(ec, profile.name, null);
+        if (reasoningLevel == null) reasoningLevel = "low";
+        Map<String, Object> attrs = new LinkedHashMap<>();
+        attrs.put(LlmApiConfig.ATTR, reasoningLevel);
+        this.conversation = LlmConversationImpl.create(ec, profile.name, attrs);
         applyWindowPolicyToConversation();
         return this;
     }
@@ -237,6 +249,40 @@ public class LlmClientImpl implements LlmClient {
     public LlmClient maxTokens(int n) {
         this.maxTokens = n;
         return this;
+    }
+    @Override
+    public LlmClient reasoning(String level) {
+        String canon = LlmApiConfig.canonical(level);
+        if (canon == null)
+            throw new LlmException("reasoning must be low, medium, or high",
+                    null, LlmFinishReason.ERROR, 400, profile.name, convId());
+        useReasoning(canon, true);
+        return this;
+    }
+
+    /** Remember the level for this client. Persist it on the conversation when persist is true and one is bound. */
+    void useReasoning(String level, boolean persist) {
+        this.reasoningLevel = level;
+        if (!persist || conversation == null || level == null) return;
+        Object cur = conversation.getAttributes().get(LlmApiConfig.ATTR);
+        if (level.equals(cur)) return;
+        conversation.setAttribute(LlmApiConfig.ATTR, level);
+    }
+
+    /** Use an explicit level, else the conversation attribute, else low. Writes low onto a conversation that has none. */
+    void ensureStoredReasoning() {
+        if (reasoningLevel != null) {
+            useReasoning(reasoningLevel, conversation != null);
+            return;
+        }
+        if (conversation != null) {
+            String stored = LlmApiConfig.canonical(conversation.getAttributes().get(LlmApiConfig.ATTR));
+            if (stored != null) {
+                reasoningLevel = stored;
+                return;
+            }
+        }
+        useReasoning("low", conversation != null);
     }
     @Override
     public LlmClient timeout(int seconds) {
@@ -522,6 +568,7 @@ public class LlmClientImpl implements LlmClient {
         conversation.persistIsolated(() -> {
             LlmMessage asst = LlmMessage.assistant(result.content);
             asst.toolCalls = result.toolCalls;
+            asst.copyProviderStateFrom(result.providerState);
             conversation.appendInternal(asst);
             conversation.writeCallLog(profile.name, profile.protocol != null ? profile.protocol.getName() : null,
                     result.model != null ? result.model : resolveModel(), profile.logContent,
@@ -610,9 +657,17 @@ public class LlmClientImpl implements LlmClient {
         return null;
     }
 
+    /** When above 0, caps the window size in characters for this call. Set after a context overflow. */
+    int overflowMaxChars = 0;
+
     List<LlmMessage> buildWindow() {
         if (conversation != null) {
             WindowPolicy policy = windowPolicy != null ? windowPolicy : conversation.getWindowPolicy();
+            if (overflowMaxChars > 0 && policy != null) {
+                // After a context overflow, trim harder for this call only. The stored policy is left alone.
+                policy = policy.copy();
+                policy.maxChars = policy.maxChars > 0 ? Math.min(policy.maxChars, overflowMaxChars) : overflowMaxChars;
+            }
             List<LlmMessage> window = conversation.buildWindow(policy);
             for (LlmMessage extra : extraMessages) {
                 if (extra == null || extra.role == LlmMessage.Role.SYSTEM) continue;
@@ -644,6 +699,8 @@ public class LlmClientImpl implements LlmClient {
         req.timeoutSeconds = timeoutSeconds != null ? timeoutSeconds : profile.timeoutSeconds;
         req.stream = false;
         req.extraBody = extraBody;
+        ensureStoredReasoning();
+        req.apiConfig = profile.apiConfig != null ? profile.apiConfig.forLevel(reasoningLevel) : null;
         req.requestFactory = profile.requestFactory;
         req.retryInitialSeconds = profile.retryInitialSeconds;
         req.retryMax = profile.retryMax;
@@ -663,6 +720,7 @@ public class LlmClientImpl implements LlmClient {
         r.model = result.model != null ? result.model : resolveModel();
         r.profileName = profile.name;
         r.conversationId = convId();
+        r.reasoning = reasoningLevel != null ? reasoningLevel : "low";
         r.httpStatus = result.httpStatus;
         r.errorMessage = result.errorMessage;
         r.providerErrorCode = result.providerErrorCode;
@@ -692,7 +750,11 @@ public class LlmClientImpl implements LlmClient {
     float nextWait(float waitSeconds) {
         float initial = profile.retryInitialSeconds > 0 ? profile.retryInitialSeconds : 2.0f;
         if (waitSeconds <= 0) return initial;
-        return waitSeconds * initial;
+        // Doubling when the initial wait is 1 or less, otherwise the configured multiplier. Capped at one minute,
+        // with up to 25% jitter so concurrent retries do not stampede the provider together.
+        float factor = initial > 1.0f ? initial : 2.0f;
+        float next = Math.min(60.0f, waitSeconds * factor);
+        return next * (1.0f + (float) (Math.random() * 0.25));
     }
 
     private static String nvl(String v, String def) { return v == null || v.isBlank() ? def : v; }
@@ -708,11 +770,24 @@ public class LlmClientImpl implements LlmClient {
     void markStreamingPersisted() { this.streamingWasPersisted = true; }
     LlmClientImpl markResumeFromYielded() { this.resumeFromYielded = true; return this; }
 
+    /** Set on the client that runs inside enter_sim, which has no conversation of its own. */
+    LlmClientImpl cancelParent;
+    private long lastStoreCancelCheck = 0L;
+    private static final long STORE_CANCEL_CHECK_MS = 2000L;
+
     boolean isExternallyCancelled() {
+        if (cancelParent != null) return cancelParent.isExternallyCancelled();
         if (conversation != null && LlmConversationImpl.STATUS_CANCELLED.equals(conversation.getStatus()))
             return true;
         LlmFacadeImpl f = facadeOrNull();
-        return f != null && f.isCancelled(convId());
+        if (f != null && f.isCancelled(convId())) return true;
+        // Poll the stored status now and then so a cancel on another node is seen here
+        long now = System.currentTimeMillis();
+        if (conversation != null && now - lastStoreCancelCheck >= STORE_CANCEL_CHECK_MS) {
+            lastStoreCancelCheck = now;
+            if (conversation.isCancelledInStore()) return true;
+        }
+        return false;
     }
     void throwIfCancelled() {
         if (isExternallyCancelled()) throw new CancellationException("LLM conversation cancelled");
@@ -759,11 +834,14 @@ public class LlmClientImpl implements LlmClient {
         return DEFAULT_MAX_ITERATIONS;
     }
 
+    public static LlmClientImpl currentClient() { return LlmAgentLoop.currentClient(); }
+
     /** Nested sim agent: same profile/protocol and parent tools except write_ui / enter_sim / find_skill / pin. */
-    LlmClientImpl nestForSim(int maxIter) {
+    public LlmClientImpl nestForSim(int maxIter) {
         LlmClientImpl nested = new LlmClientImpl(ec, profile, transactionInPlace);
         nested.maxIterations(maxIter > 0 ? maxIter : 32);
         nested.activeSkillName = activeSkillName;
+        nested.cancelParent = this;
         nested.allowedPaths.addAll(allowedPaths);
         nested.allowedEntities.addAll(allowedEntities);
         for (LlmTool t : tools) {

@@ -629,7 +629,7 @@ along with this software (see the LICENSE.md file). If not, see
                         <xs:attribute name="methods" type="xs:string" default="GET"/>
                     </xs:complexType></xs:element>
                     <xs:element name="allowed-service" minOccurs="0" maxOccurs="unbounded"><xs:complexType>
-                        <xs:annotation><xs:documentation>Optional typed LlmTool.service(); off by default on the servlet.</xs:documentation></xs:annotation>
+                        <xs:annotation><xs:documentation>Reserved. Declared for typed LlmTool.service() allow-lists, not read by the gateway yet.</xs:documentation></xs:annotation>
                         <xs:attribute name="name" type="xs:string" use="required"/>
                         <xs:attribute name="function-name" type="xs:string"/>
                         <xs:attribute name="description" type="xs:string"/>
@@ -647,19 +647,37 @@ along with this software (see the LICENSE.md file). If not, see
                         <xs:attribute name="package" type="xs:string"/>
                         <xs:attribute name="entity" type="xs:string"/>
                     </xs:complexType></xs:element>
+                    <xs:element name="api-config" minOccurs="0"><xs:complexType>
+                        <xs:annotation><xs:documentation>JSON objects merged into each chat request. base is always
+                            applied. low, medium, or high is then deep-merged on top, from the conversation attribute
+                            reasoning. A new conversation is low. Nested objects combine. Scalars and arrays replace.
+                            JSON null removes a key set by base. messages, tools, and stream are left as the protocol
+                            wrote them. Omit the element to send no extra fields.
+                        </xs:documentation></xs:annotation>
+                        <xs:sequence>
+                            <xs:element name="base" type="xs:string" minOccurs="0"/>
+                            <xs:element name="low" type="xs:string" minOccurs="0"/>
+                            <xs:element name="medium" type="xs:string" minOccurs="0"/>
+                            <xs:element name="high" type="xs:string" minOccurs="0"/>
+                        </xs:sequence>
+                    </xs:complexType></xs:element>
                 </xs:sequence>
                 <xs:attribute name="name" type="xs:string" use="required"/>
                 <xs:attribute name="protocol" type="xs:string" default="org.moqui.impl.llm.OpenAiCompatProtocol"/>
                 <xs:attribute name="url" type="xs:string"/>
-                <xs:attribute name="path" type="xs:string" default="/v1/chat/completions"/>
+                <xs:attribute name="path" type="xs:string">
+                    <xs:annotation><xs:documentation>Request path. When omitted the protocol default is used: /v1/chat/completions, or /v1/responses for the Responses protocol.</xs:documentation></xs:annotation>
+                </xs:attribute>
                 <xs:attribute name="api-key" type="xs:string"/>
                 <xs:attribute name="auth-header-name" type="xs:string" default="Authorization"/>
                 <xs:attribute name="auth-header-pattern" type="xs:string" default="Bearer ${api-key}"/>
                 <xs:attribute name="model" type="xs:string"/>
-                <xs:attribute name="max-tokens-parameter" default="max_tokens">
+                <xs:attribute name="max-tokens-parameter">
+                    <xs:annotation><xs:documentation>Request key for the token limit. When omitted the protocol default is used: max_tokens for Chat Completions, max_output_tokens for Responses.</xs:documentation></xs:annotation>
                     <xs:simpleType><xs:restriction base="xs:token">
                         <xs:enumeration value="max_tokens"/>
                         <xs:enumeration value="max_completion_tokens"/>
+                        <xs:enumeration value="max_output_tokens"/>
                     </xs:restriction></xs:simpleType>
                 </xs:attribute>
                 <xs:attribute name="allow-write-ui" type="boolean-expandable" default="false"/>
@@ -701,19 +719,13 @@ along with this software (see the LICENSE.md file). If not, see
                     </xs:documentation></xs:annotation>
                 </xs:attribute>
                 <xs:attribute name="allow-tx-over-http" type="boolean-expandable" default="false"/>
-                <xs:attribute name="tool-result-max-chars" type="xs:positiveInteger" default="8000"/>
+                <xs:attribute name="tool-result-max-chars" type="xs:positiveInteger" default="65536"/>
                 <xs:attribute name="sse-ping-seconds" type="xs:positiveInteger" default="15"/>
                 <xs:attribute name="timeout-seconds" type="xs:positiveInteger" default="120"/>
                 <xs:attribute name="retry-initial-seconds" type="xs:decimal" default="2"/>
                 <xs:attribute name="retry-max" type="xs:nonNegativeInteger" default="5"/>
                 <xs:attribute name="timeout-retry" type="boolean-expandable" default="true"/>
                 <xs:attribute name="empty-retries" type="xs:nonNegativeInteger" default="2"/>
-                <xs:attribute name="context-limit-policy" default="fail">
-                    <xs:simpleType><xs:restriction base="xs:token">
-                        <xs:enumeration value="fail"/>
-                        <xs:enumeration value="trim-once"/>
-                    </xs:restriction></xs:simpleType>
-                </xs:attribute>
                 <xs:attribute name="max-tokens" type="xs:positiveInteger"/>
                 <xs:attribute name="temperature" type="xs:decimal"/>
                 <xs:attribute name="max-iterations" type="xs:positiveInteger" default="8"/>
@@ -944,6 +956,12 @@ along with this software (see the LICENSE.md file). If not, see
                     <xs:enumeration value="mssql-contains"/>
                     <xs:enumeration value="oracle-text"/>
                 </xs:restriction></xs:simpleType>
+            </xs:attribute>
+            <xs:attribute name="fts-ddl" default="true" type="xs:boolean">
+                <xs:annotation><xs:documentation>
+                    When false Moqui does not create the generated tsvector column, GIN or FULLTEXT index for text-fts fields.
+                    Use it when a DBA manages them, because on PostgreSQL adding the stored column rewrites the table.
+                </xs:documentation></xs:annotation>
             </xs:attribute>
             <xs:attribute name="fts-config" default="english" type="xs:token">
                 <xs:annotation><xs:documentation>

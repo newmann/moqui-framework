@@ -34,6 +34,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class RestClientStreamTests extends Specification {
+    def "redactUri masks credential-looking query values only"() {
+        expect:
+        RestClient.redactUri("https://h/v1/x?key=SECRET&api-version=2024&access_token=abc#f") ==
+                "https://h/v1/x?key=***&api-version=2024&access_token=***#f"
+        RestClient.redactUri("https://h/v1/x") == "https://h/v1/x"
+        RestClient.redactUri(null) == null
+    }
+
     protected final static Logger logger = LoggerFactory.getLogger(RestClientStreamTests.class)
 
     @Shared Server server
@@ -138,6 +146,8 @@ class RestClientStreamTests extends Specification {
         then:
         stream.getStatusCode() == 200
         stream.getContentType() == "text/event-stream"
+        stream.headers().get("Permissions-Policy") == [
+                'payment=(self "https://checkout.stripe.com" "https://js.stripe.com")']
         events == ["chunk-1"]
         !moreEvents
         handlerFinished
@@ -260,6 +270,9 @@ class RestClientStreamTests extends Specification {
             response.setStatus(200)
             response.getHeaders().put(HttpHeader.CONTENT_TYPE, "text/event-stream; charset=UTF-8")
             response.getHeaders().put(HttpHeader.CACHE_CONTROL, "no-cache")
+            // Structured field syntax, not comma-separated HTTP quoted-CSV.
+            response.getHeaders().put("Permissions-Policy",
+                    'payment=(self "https://checkout.stripe.com" "https://js.stripe.com")')
         }
 
         private static void writeChunk(Response response, String text, boolean last) throws IOException {

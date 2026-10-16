@@ -56,6 +56,7 @@ public class EntityFindImpl extends EntityFindBase {
             // Actual-entity one(): miss in H2 means copy-on-read from production via onePut in EntityFindBase.
             // View-entity one(): query H2 after copying production members (overlay creates have no production row).
             if (ed.isViewEntity) {
+                if (db.answerAggregateViewFromProduction(ed)) return oneInternal(whereCondition, fieldInfoArray, fieldOptionsArray, null);
                 db.ensureReady(ed);
                 db.beginBypass();
                 try {
@@ -64,6 +65,12 @@ public class EntityFindImpl extends EntityFindBase {
                 } finally {
                     db.endBypass();
                 }
+                return oneInternal(whereCondition, fieldInfoArray, fieldOptionsArray, db);
+            }
+            // Not a pure key lookup (find by name or status, or key plus other conditions): production alone would
+            // miss rows created or changed in the sim and return a stale one. Copy the matches, then ask the overlay.
+            if (!isPurePkFind()) {
+                copyWorkingSet(db, whereCondition, null, new ArrayList<>(), fieldInfoArray, fieldOptionsArray, false);
                 return oneInternal(whereCondition, fieldInfoArray, fieldOptionsArray, db);
             }
         }
@@ -153,8 +160,11 @@ public class EntityFindImpl extends EntityFindBase {
                                                ArrayList<String> orderByExpanded, FieldInfo[] fieldInfoArray,
                                                FieldOrderOptions[] fieldOptionsArray) throws SQLException {
         TransactionCacheDb db = overlayDb();
+        if (db != null && db.answerAggregateViewFromProduction(getEntityDef())) {
+            return iteratorInternal(whereCondition, havingCondition, orderByExpanded, fieldInfoArray, fieldOptionsArray, null, null);
+        }
         if (db != null) {
-            copyWorkingSet(db, whereCondition, havingCondition, orderByExpanded, fieldInfoArray, fieldOptionsArray);
+            copyWorkingSet(db, whereCondition, havingCondition, orderByExpanded, fieldInfoArray, fieldOptionsArray, false);
             return iteratorInternal(whereCondition, havingCondition, orderByExpanded, fieldInfoArray, fieldOptionsArray,
                     db, null);
         }
@@ -173,15 +183,31 @@ public class EntityFindImpl extends EntityFindBase {
 
     private void copyWorkingSet(TransactionCacheDb db, EntityConditionImplBase whereCondition,
             EntityConditionImplBase havingCondition, ArrayList<String> orderByExpanded, FieldInfo[] fieldInfoArray,
-            FieldOrderOptions[] fieldOptionsArray) throws SQLException {
+            FieldOrderOptions[] fieldOptionsArray, boolean forCount) throws SQLException {
         EntityDefinition ed = getEntityDef();
         db.ensureReady(ed);
         db.beginBypass();
         boolean wasForUpdate = getForUpdate();
         if (wasForUpdate && db.isHold()) forUpdate(false);
+        // Copy whole rows. A partial select would insert nulls for the other columns and later reads of the
+        // overlay row would return them. Aggregate views keep their own select list.
+        FieldInfo[] copyFields = !ed.isViewEntity && ed.entityInfo.allFieldInfoArray != null
+                ? ed.entityInfo.allFieldInfoArray : fieldInfoArray;
+        FieldOrderOptions[] copyOptions = copyFields == fieldInfoArray ? fieldOptionsArray : null;
+        // Paging is applied once, on the overlay. Paging the production copy as well would skip the
+        // offset twice. Copy the first offset+limit rows in order so the overlay holds every row of the page.
+        Integer savedLimit = limit, savedOffset = offset;
+        if (forCount) {
+            limit = null;
+        } else if (limit != null) {
+            int slack = db.deletedCount() + 1;
+            limit = limit + (offset != null ? offset : 0) + slack;
+        }
+        offset = null;
         try {
-            try (EntityListIterator eli = iteratorInternal(whereCondition, havingCondition, orderByExpanded,
-                    fieldInfoArray, fieldOptionsArray, null, null)) {
+            try (EntityListIterator eli = iteratorInternal(whereCondition, havingCondition,
+                    orderByExpanded != null ? orderByExpanded : new ArrayList<>(),
+                    copyFields, copyOptions, null, null)) {
                 EntityValue ev;
                 int n = 0;
                 while ((ev = eli.next()) != null) {
@@ -192,6 +218,8 @@ public class EntityFindImpl extends EntityFindBase {
                 }
             }
         } finally {
+            limit = savedLimit;
+            offset = savedOffset;
             if (wasForUpdate && db.isHold()) forUpdate(true);
             db.endBypass();
         }
@@ -272,8 +300,11 @@ public class EntityFindImpl extends EntityFindBase {
     public long countExtended(EntityConditionImplBase whereCondition, EntityConditionImplBase havingCondition,
                               FieldInfo[] fieldInfoArray, FieldOrderOptions[] fieldOptionsArray) throws SQLException {
         TransactionCacheDb db = overlayDb();
+        if (db != null && db.answerAggregateViewFromProduction(getEntityDef())) {
+            return countInternal(whereCondition, havingCondition, fieldInfoArray, fieldOptionsArray, null);
+        }
         if (db != null) {
-            copyWorkingSet(db, whereCondition, havingCondition, null, fieldInfoArray, fieldOptionsArray);
+            copyWorkingSet(db, whereCondition, havingCondition, null, fieldInfoArray, fieldOptionsArray, true);
             return countInternal(whereCondition, havingCondition, fieldInfoArray, fieldOptionsArray, db);
         }
         return countInternal(whereCondition, havingCondition, fieldInfoArray, fieldOptionsArray, null);

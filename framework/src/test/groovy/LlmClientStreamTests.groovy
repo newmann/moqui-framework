@@ -158,6 +158,21 @@ class LlmClientStreamTests extends Specification {
         listener.reasoningDeltas == ["Let me ", "think."]
     }
 
+    def "stream keeps reasoning_content and tool-call extra_content for replay"() {
+        given:
+        handler.scenario = "replay_fields"
+        def listener = new ProtoListener()
+        when:
+        new OpenAiCompatProtocol().chatStream(req(), listener)
+        then:
+        listener.failure == null
+        listener.complete.finishReason == LlmFinishReason.TOOL_CALLS
+        listener.complete.reasoning == "because"
+        listener.complete.providerState.reasoningContent == "because"
+        listener.complete.toolCalls[0].providerFields.extra_content.google.thought_signature == "sig"
+        listener.deltas.isEmpty()
+    }
+
     def "tool_call argument chunks are concatenated by index"() {
         given:
         handler.scenario = "tool_calls"
@@ -179,8 +194,11 @@ class LlmClientStreamTests extends Specification {
         given:
         handler.scenario = "write_ui"
         def listener = new ProtoListener()
+        def request = req()
+        // Partial arguments stream only for a tool that asks for it, which write_ui does
+        request.tools = [org.moqui.llm.LlmTool.writeUi()]
         when:
-        new OpenAiCompatProtocol().chatStream(req(), listener)
+        new OpenAiCompatProtocol().chatStream(request, listener)
         then:
         listener.failure == null
         listener.complete.toolCalls[0].name == "write_ui"
@@ -267,6 +285,19 @@ class LlmClientStreamTests extends Specification {
         handler.hits.get() == 1
     }
 
+    def "a tool that does not ask for partial arguments gets none, even with long streamed arguments"() {
+        given:
+        handler.scenario = "write_ui"
+        def listener = new ProtoListener()
+        def request = req()
+        request.tools = [org.moqui.llm.LlmTool.request()]
+        when:
+        new OpenAiCompatProtocol().chatStream(request, listener)
+        then:
+        listener.failure == null
+        listener.toolCallDeltas.isEmpty()
+    }
+
     def "tool_call argument chunks without index concatenate onto the current call"() {
         given:
         handler.scenario = "tool_calls_no_index"
@@ -280,6 +311,19 @@ class LlmClientStreamTests extends Specification {
         listener.complete.toolCalls[0].id == "call_1"
         listener.complete.toolCalls[0].name == "request"
         listener.complete.toolCalls[0].arguments == '{"method":"GET"}'
+    }
+
+    def "parallel tool calls that reuse index 0 stay separate calls and blank arguments replay as an empty object"() {
+        given:
+        handler.scenario = "parallel_same_index"
+        def listener = new ProtoListener()
+        when:
+        new OpenAiCompatProtocol().chatStream(req(), listener)
+        then:
+        listener.failure == null
+        listener.complete.toolCalls*.id == ["call_a", "call_b"]
+        listener.complete.toolCalls[0].arguments == '{"q":"a"}'
+        listener.complete.toolCalls[1].name == "request"
     }
 
     static class ProtoListener implements ProtocolStreamListener {
@@ -351,12 +395,24 @@ class LlmClientStreamTests extends Specification {
                     writeChunk(response, sse('{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}'), false)
                     writeChunk(response, "data: [DONE]\n\n", true)
                     callback.succeeded()
+                } else if ("replay_fields".equals(sc)) {
+                    writeChunk(response, sse('{"choices":[{"index":0,"delta":{"reasoning_content":"because"}}]}'), false)
+                    writeChunk(response, sse('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","extra_content":{"google":{"thought_signature":"sig"}},"function":{"name":"request","arguments":"{}"}}]}}]}'), false)
+                    writeChunk(response, sse('{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}'), false)
+                    writeChunk(response, "data: [DONE]\n\n", true)
+                    callback.succeeded()
                 } else if ("tool_calls".equals(sc)) {
                     writeChunk(response, sse('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"request","arguments":""}}]}}]}'), false)
                     writeChunk(response, sse('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"method\\":"}}]}}]}'), false)
                     writeChunk(response, sse('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"GET\\"}"}}]}}]}'), false)
                     writeChunk(response, sse('{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}'), false)
                     writeChunk(response, sse(usageChunk(9, 4, 13)), false)
+                    writeChunk(response, "data: [DONE]\n\n", true)
+                    callback.succeeded()
+                } else if ("parallel_same_index".equals(sc)) {
+                    writeChunk(response, sse('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"browse","arguments":"{\\"q\\":\\"a\\"}"}}]}}]}'), false)
+                    writeChunk(response, sse('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"request","arguments":""}}]}}]}'), false)
+                    writeChunk(response, sse('{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}'), false)
                     writeChunk(response, "data: [DONE]\n\n", true)
                     callback.succeeded()
                 } else if ("no_usage".equals(sc)) {

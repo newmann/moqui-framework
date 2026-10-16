@@ -18,6 +18,7 @@ import org.moqui.context.ArtifactTarpitException;
 import org.moqui.context.TransactionFacade;
 import org.moqui.entity.EntityValue;
 import org.moqui.impl.context.ExecutionContextImpl;
+import org.moqui.impl.llm.tools.WriteUiTool;
 import org.moqui.llm.LlmException;
 import org.moqui.llm.LlmFinishReason;
 import org.moqui.llm.LlmMessage;
@@ -54,6 +55,7 @@ final class LlmAgentLoop {
     private final LlmClientImpl client;
     private LlmStreamListener listener;
     private List<ResumeEmit> resumeEmits;
+    private int overflowShrinks = 0;
 
     static LlmClientImpl currentClient() { return CURRENT_CLIENT.get(); }
 
@@ -118,6 +120,17 @@ final class LlmAgentLoop {
                         null, LlmFinishReason.CONTENT_FILTER, result.httpStatus, client.profile.name, client.convId());
             }
             if (fr == LlmFinishReason.CONTEXT_OVERFLOW) {
+                // A stored conversation can be trimmed harder. Try twice at half the size before giving up.
+                if (client.conversation != null && overflowShrinks < 2) {
+                    int chars = 0;
+                    for (LlmMessage m : window) if (m != null && m.content != null) chars += m.content.length();
+                    int cap = Math.max(4000, chars / 2);
+                    if (client.overflowMaxChars == 0 || cap < client.overflowMaxChars) {
+                        overflowShrinks++;
+                        client.overflowMaxChars = cap;
+                        continue;
+                    }
+                }
                 throw new LlmException(nvl(result.errorMessage, "LLM context length exceeded"),
                         null, LlmFinishReason.CONTEXT_OVERFLOW, result.httpStatus, client.profile.name, client.convId());
             }
@@ -132,7 +145,7 @@ final class LlmAgentLoop {
                         null, LlmFinishReason.EMPTY, result.httpStatus, client.profile.name, client.convId());
             }
             if (fr != LlmFinishReason.STOP && fr != LlmFinishReason.LENGTH && fr != LlmFinishReason.TOOL_CALLS) {
-                boolean retryable = result.retryable;
+                boolean retryable = result.retryable && !streamDelivered;
                 if (retryable && errorAttempts < client.profile.retryMax) {
                     errorAttempts++;
                     client.sleepBackoff(waitSeconds);
@@ -145,11 +158,18 @@ final class LlmAgentLoop {
 
             iteration++;
             emptyAttempts = 0;
+            // A success ends the failure streak, so the next one starts with a fresh budget and short wait
+            errorAttempts = 0;
+            waitSeconds = client.profile.retryInitialSeconds > 0 ? client.profile.retryInitialSeconds : 0;
             List<LlmToolCall> calls = result.getToolCalls();
             boolean hasCalls = calls != null && !calls.isEmpty();
 
+            // Some OpenAI-compatible servers report finish_reason=stop alongside tool calls, so calls win over STOP.
+            // A call cut off by the token limit has partial arguments and is dropped, since no result could pair with it.
+            boolean runCalls = hasCalls && fr != LlmFinishReason.LENGTH;
             LlmMessage asst = LlmMessage.assistant(result.content);
-            asst.toolCalls = hasCalls ? new ArrayList<>(calls) : null;
+            asst.toolCalls = runCalls ? new ArrayList<>(calls) : null;
+            asst.copyProviderStateFrom(result.providerState);
             if (client.conversation != null) {
                 final ProtocolResult logResult = result;
                 final int logIter = iteration;
@@ -164,7 +184,7 @@ final class LlmAgentLoop {
                 working.add(asst);
             }
 
-            if (!hasCalls || fr == LlmFinishReason.STOP || fr == LlmFinishReason.LENGTH) {
+            if (!runCalls) {
                 completeConversation();
                 client.throwIfCancelled();
                 LlmResponse r = client.toResponse(result, fr, start);
@@ -217,14 +237,7 @@ final class LlmAgentLoop {
                 if (!client.allowClientTools) {
                     for (LlmToolCall call : clientCalls) {
                         Map<String, Object> err = errorMap(CLIENT_UNAVAILABLE);
-                        LlmTrace.logToolCall(call.name, call.arguments);
-                        LlmTrace.logToolResult(call.name, err);
-                        if (listener != null) {
-                            listener.onToolCall(call, LlmTool.Execution.CLIENT);
-                            listener.onToolResult(call, err, LlmTool.Execution.CLIENT);
-                        }
-                        roundResults.add(new LlmToolResult(call.id, call.name, err));
-                        appendTool(working, call.id, call.name, err);
+                        recordClientResult(working, roundResults, call, call, err);
                     }
                     continue;
                 }
@@ -236,18 +249,18 @@ final class LlmAgentLoop {
                     Map<String, Object> args = LlmJson.tryToMap(call.arguments);
                     if (args == null) {
                         Map<String, Object> err = errorMap(MALFORMED + call.arguments);
-                        LlmTrace.logToolCall(call.name, call.arguments);
-                        LlmTrace.logToolResult(call.name, err);
-                        if (listener != null) {
-                            listener.onToolCall(copy, LlmTool.Execution.CLIENT);
-                            listener.onToolResult(copy, err, LlmTool.Execution.CLIENT);
-                        }
-                        roundResults.add(new LlmToolResult(call.id, call.name, err));
-                        appendTool(working, call.id, call.name, err);
+                        recordClientResult(working, roundResults, call, copy, err);
                         continue;
                     }
                     if (tool != null) {
                         Map<String, Object> enriched = tool.enrichForClient(args, client.ec);
+                        // A client tool that failed its server check is a result. Do not yield it.
+                        if (enriched != null && enriched.get("error") != null
+                                && !(enriched.get("error") instanceof String
+                                    && ((String) enriched.get("error")).isBlank())) {
+                            recordClientResult(working, roundResults, call, copy, enriched);
+                            continue;
+                        }
                         Map<String, Object> previousCanvas = null;
                         boolean canvasTouched = false;
                         if (enriched != null && WriteUiTool.NAME.equals(call.name)
@@ -267,14 +280,7 @@ final class LlmAgentLoop {
                                 err.put("instruction", "These bodyFromFields names are not fields, so the click does not send them: "
                                         + unbound + ". Add each as a field with defaultValue. A display field is not a parameter.");
                                 err.put("fields", unbound);
-                                LlmTrace.logToolCall(call.name, call.arguments);
-                                LlmTrace.logToolResult(call.name, err);
-                                if (listener != null) {
-                                    listener.onToolCall(copy, LlmTool.Execution.CLIENT);
-                                    listener.onToolResult(copy, err, LlmTool.Execution.CLIENT);
-                                }
-                                roundResults.add(new LlmToolResult(call.id, call.name, err));
-                                appendTool(working, call.id, call.name, err);
+                                recordClientResult(working, roundResults, call, copy, err);
                                 continue;
                             }
                         }
@@ -298,7 +304,11 @@ final class LlmAgentLoop {
                 null, LlmFinishReason.MAX_ITERATIONS, 0, client.profile.name, client.convId());
     }
 
+    /** True once a delta reached the client in the current call. Retrying then would replay text the user already saw. */
+    private boolean streamDelivered = false;
+
     private ProtocolResult invokeProtocol(ProtocolRequest req) {
+        streamDelivered = false;
         if (listener != null) req.stream = true;
         LlmTrace.logRequest(client, req);
         long t0 = System.currentTimeMillis();
@@ -314,12 +324,13 @@ final class LlmAgentLoop {
             try {
                 client.profile.protocol.chatStream(req, new ProtocolStreamListener() {
                     @Override public void onDelta(String textDelta) {
-                        if (textDelta != null && !textDelta.isEmpty()) listener.onDelta(textDelta);
+                        if (textDelta != null && !textDelta.isEmpty()) { streamDelivered = true; listener.onDelta(textDelta); }
                     }
                     @Override public void onReasoningDelta(String textDelta) {
                         if (textDelta != null && !textDelta.isEmpty()) listener.onReasoningDelta(textDelta);
                     }
                     @Override public void onToolCallDelta(String name, String argumentsSoFar) {
+                        streamDelivered = true;
                         listener.onToolCallDelta(name, argumentsSoFar);
                     }
                     @Override public void onComplete(ProtocolResult r) { box[0] = r; }
@@ -345,6 +356,19 @@ final class LlmAgentLoop {
             client.conversation.setPendingToolCallsInternal(null);
             client.conversation.setStatusInternal(LlmConversationImpl.STATUS_COMPLETE);
         });
+    }
+
+    /** A client tool call that ends as a result instead of a yield: trace it, tell the listener, record it. */
+    private void recordClientResult(List<LlmMessage> working, List<LlmToolResult> roundResults,
+            LlmToolCall call, LlmToolCall shown, Object result) {
+        LlmTrace.logToolCall(call.name, call.arguments);
+        LlmTrace.logToolResult(call.name, result);
+        if (listener != null) {
+            listener.onToolCall(shown, LlmTool.Execution.CLIENT);
+            listener.onToolResult(shown, result, LlmTool.Execution.CLIENT);
+        }
+        roundResults.add(new LlmToolResult(call.id, call.name, result));
+        appendTool(working, call.id, call.name, result);
     }
 
     private void appendTool(List<LlmMessage> working, String toolCallId, String name, Object content) {
@@ -410,6 +434,26 @@ final class LlmAgentLoop {
     }
 
     Object executeOne(LlmToolCall call, boolean confirmed) {
+        Object result = executeOneUnchecked(call, confirmed);
+        throwIfSimTerminated();
+        return result;
+    }
+
+    /**
+     * A transaction that wrote to the sim overlay and rolled back poisons it, and the overlay cannot undo writes.
+     * Stop the nested loop here instead of letting the model keep working in a state that production would not reach.
+     */
+    private void throwIfSimTerminated() {
+        if (!(client.ec instanceof ExecutionContextImpl)) return;
+        ExecutionContextImpl eci = (ExecutionContextImpl) client.ec;
+        if (!eci.simSession) return;
+        Object cache = eci.entityTxCache;
+        if (cache instanceof org.moqui.impl.context.TransactionCacheDb
+                && ((org.moqui.impl.context.TransactionCacheDb) cache).isPoisoned())
+            throw new org.moqui.impl.context.SimTerminatedException(((org.moqui.impl.context.TransactionCacheDb) cache).getPoisonedReason());
+    }
+
+    private Object executeOneUnchecked(LlmToolCall call, boolean confirmed) {
         if (!SkillUseGate.allowed(client, call.name)) return SkillUseGate.refusal();
         if (!confirmed) {
             SkillRiskGate.Decision decision = SkillRiskGate.decide(client, call);
@@ -431,7 +475,7 @@ final class LlmAgentLoop {
             // the current transaction only setRollbackOnly, which then blocks saving the tool result.
             if (tf != null && tf.isTransactionInPlace()) suspended = tf.suspend();
             try {
-                return tool.execute(args, client.ec);
+                return LlmConversationImpl.withCallerAuthz(client.ec, () -> tool.execute(args, client.ec));
             } catch (Throwable t) {
                 failed = true;
                 return errorMap(t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName());
@@ -484,7 +528,8 @@ final class LlmAgentLoop {
         for (LlmToolResult tr : results) {
             if (tr == null) continue;
             String id = tr.toolCallId;
-            if (id == null || !pendingIds.contains(id)) continue;
+            // A repeated id must not execute a confirmed write a second time
+            if (id == null || !pendingIds.contains(id) || seen.contains(id)) continue;
             LlmToolCall pendingCall = pendingCallById(pending, id);
             Object content = resumeContent(pendingCall, tr.content);
             conv.appendInternal(LlmMessage.tool(id, tr.name, contentText(content)));
@@ -634,7 +679,7 @@ final class LlmAgentLoop {
             }
         }
         String text = sb.toString().trim();
-        return text.length() > 800 ? text.substring(0, 800) : text;
+        return text.length() > 300 ? text.substring(0, 300) : text;
     }
 
     private static void appendNote(StringBuilder sb, Object value) {
@@ -688,7 +733,7 @@ final class LlmAgentLoop {
             Map<String, Object> args = LlmJson.tryToMap(argumentsJson);
             String method = args != null && args.get("method") != null ? args.get("method").toString() : null;
             if (method != null) {
-                String m = method.trim().toUpperCase();
+                String m = method.trim().toUpperCase(java.util.Locale.ROOT);
                 if ("GET".equals(m) || "HEAD".equals(m)) return false;
             }
             Object status = stored.get("status");

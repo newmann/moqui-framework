@@ -16,7 +16,7 @@ import groovy.json.JsonSlurper
 import org.moqui.Moqui
 import org.moqui.context.ExecutionContext
 import org.moqui.entity.EntityValue
-import org.moqui.impl.llm.EnterSimTool
+import org.moqui.impl.llm.tools.EnterSimTool
 import org.moqui.impl.llm.LlmClientImpl
 import org.moqui.impl.llm.LlmFacadeImpl
 import org.moqui.impl.llm.LlmGateway
@@ -101,7 +101,7 @@ class LlmSkillAgentTests extends Specification {
         !proto.lastRequest.window.any { it.role == LlmMessage.Role.TOOL && it.name == "enter_sim" }
     }
 
-    def "skill miss enters sim, nested write does not persist, proposed skill admits after world pass"() {
+    def "skill miss enters sim, nested write does not persist, proposed skill waits for a click and stays proposed"() {
         given:
         String stamp = Long.toString(System.currentTimeMillis())
         String skillName = "create-test-entity-" + stamp
@@ -147,20 +147,27 @@ Call run_service create#moqui.test.TestEntity with testId and testMedium.
         LlmClientImpl client = agent(proto)
 
         when:
-        LlmResponse r = client.user("frobnicate a widget").call()
+        def conv = org.moqui.impl.llm.LlmConversationImpl.create(ec, "default", null)
+        LlmResponse first = client.conversation(conv).user("frobnicate a widget").call()
+        // The sim-written risk: reversible is not honored, so the world write waits for a click
+        EntityValue beforeConfirm = ec.entity.find("moqui.test.TestEntity").condition("testId", worldId).one()
+        LlmResponse r = agent(proto).conversation(conv).toolResults([new org.moqui.llm.LlmToolResult(
+                first.pendingToolCalls[0].id, "run_service", [confirmed: true])]).call()
         EntityValue simRow = ec.entity.find("moqui.test.TestEntity").condition("testId", simId).one()
         EntityValue worldRow = ec.entity.find("moqui.test.TestEntity").condition("testId", worldId).one()
         EntityValue proposed = ec.entity.find("moqui.llm.LlmSkill").condition("name", skillName).useCache(false).one()
 
         then:
+        first.yielded
+        beforeConfirm == null
         r.content == "world created " + worldId
         simRow == null
         worldRow != null
         worldRow.testMedium == "from-world"
         proposed != null
-        proposed.statusId == "LsksActive"
-        proposed.provenanceId == "LskpMixed"
-        (proposed.worldSuccessCount as Number).longValue() >= 1L
+        // A confirmed resume never promotes a model-proposed skill
+        proposed.statusId == "LsksProposed"
+        proposed.provenanceId == "LskpSim"
         def enterTool = proto.lastRequest.window.findAll { it.role == LlmMessage.Role.TOOL && it.name == "enter_sim" }
         enterTool
         enterTool[-1].content.contains("proposedSkillId")
@@ -205,8 +212,9 @@ Call run_service create#moqui.test.TestEntity with testId and testMedium.
         then:
         persisted != null
         persisted.skillId
-        admitted.statusId == "LsksActive"
-        docs.any { it.name == name }
+        admitted.statusId == "LsksProposed"
+        admitted.worldSuccessCount == 1
+        !docs.any { it.name == name }
 
         cleanup:
         boolean d = ec.artifactExecution.disableAuthz()
@@ -324,6 +332,30 @@ Call run_service create#moqui.test.TestEntity with testId and testMedium.
         ui != null
         ui.content instanceof Map
         ((Map) ui.content).error == "skill_required"
+    }
+
+    def "force skill use refuses screen_use without yield"() {
+        given:
+        def proto = new FakeLlmProtocol()
+        proto.handler = { ProtocolRequest req ->
+            def last = lastTool(req)
+            if (last?.name == "screen_use") return FakeLlmProtocol.stop("stayed")
+            return FakeLlmProtocol.toolCalls(new LlmToolCall("s1", "screen_use", '{"action":"snapshot"}'))
+        }
+        LlmClientImpl client = agent(proto).forceSkillUse(true)
+        client.allowClientTools(true)
+        client.tool(LlmTool.screenUse())
+
+        when:
+        LlmResponse r = client.user("look at this screen").call()
+
+        then:
+        !r.yielded
+        r.content == "stayed"
+        def use = r.toolResults.find { it.name == "screen_use" }
+        use != null
+        use.content instanceof Map
+        ((Map) use.content).error == "skill_required"
     }
 
     def "unknown select does not activate; subsequent browse still refused"() {
@@ -470,7 +502,7 @@ Call run_service create#moqui.test.TestEntity.
         given:
         String stamp = Long.toString(System.currentTimeMillis())
         String skillName = "huge-skill-" + stamp
-        String pad = "x" * 9000
+        String pad = "x" * 70000
         def proto = new FakeLlmProtocol()
         proto.handler = { ProtocolRequest req ->
             boolean sim = isSim(req)
@@ -524,6 +556,58 @@ ${pad}
         } finally {
             if (!d) ec.artifactExecution.enableAuthz()
         }
+    }
+
+    def "tool execution inside persistIsolated runs with the caller's authz, not the bookkeeping bypass"() {
+        given:
+        ec.artifactExecution.enableAuthz()
+        boolean inside = false
+        boolean inTool = true
+        boolean after = false
+
+        when:
+        org.moqui.impl.llm.LlmConversationImpl.persistIsolated(ec, {
+            inside = ec.artifactExecution.disableAuthz() // true means it was already disabled by persistIsolated
+            inTool = org.moqui.impl.llm.LlmConversationImpl.withCallerAuthz(ec, { ec.artifactExecution.disableAuthz() })
+        } as Runnable, null)
+        after = ec.artifactExecution.disableAuthz()
+
+        then:
+        inside
+        !inTool
+        !after
+
+        cleanup:
+        ec.artifactExecution.disableAuthz()
+    }
+
+    def "enter_sim returns a terminated result when the sim overlay is poisoned, and nothing reaches production"() {
+        given:
+        String simId = "TERM" + System.currentTimeMillis()
+        def proto = new FakeLlmProtocol()
+        proto.handler = { ProtocolRequest req ->
+            if (isSim(req)) {
+                // Stand in for a rolled-back write: the overlay is poisoned, then the sim agent tries another call
+                ((org.moqui.impl.context.ExecutionContextImpl) ec).entityTxCache?.poison("test: a write was rolled back")
+                String args = '{"serviceName":"create#moqui.test.TestEntity","parameters":{"testId":"' + simId + '","testMedium":"x"}}'
+                return FakeLlmProtocol.toolCalls(new LlmToolCall("s1", "run_service", args))
+            }
+            def last = lastTool(req)
+            if (last?.name == "enter_sim") return FakeLlmProtocol.stop("parent saw the sim result")
+            return FakeLlmProtocol.toolCalls(new LlmToolCall("e1", "enter_sim", '{"goal":"try a write"}'))
+        }
+
+        when:
+        LlmResponse r = agent(proto).user("go").call()
+        def simResult = proto.lastRequest.window.findAll { it.role == LlmMessage.Role.TOOL && it.name == "enter_sim" }[-1].content
+
+        then:
+        r.content == "parent saw the sim result"
+        simResult.contains("sim_terminated")
+        simResult.contains("terminated")
+        simResult.contains("enter_sim again")
+        ec.entity.find("moqui.test.TestEntity").condition("testId", simId).useCache(false).count() == 0
+        !ec.entity.isTxCacheActive()
     }
 
     def "getByName finds shipped and proposed skills"() {
@@ -847,6 +931,9 @@ steps
         boolean began = ec.transaction.begin(null)
         SkillIndex.persistProposed(ec, doc, "steps")
         SkillIndex.admitWorldPass(ec, skillName)
+        // Only human-authored skills may waive confirmation
+        def revRow = ec.entity.find("moqui.llm.LlmSkill").condition("name", skillName).useCache(false).forUpdate(true).one()
+        revRow.set("provenanceId", "LskpHuman").update()
         if (began) ec.transaction.commit()
 
         def proto = new FakeLlmProtocol()

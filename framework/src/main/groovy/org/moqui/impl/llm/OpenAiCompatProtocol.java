@@ -39,7 +39,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class OpenAiCompatProtocol implements LlmProtocol {
+public class OpenAiCompatProtocol extends HttpLlmProtocol {
     private static final Logger logger = LoggerFactory.getLogger(OpenAiCompatProtocol.class);
     public static final String DEFAULT_PATH = "/v1/chat/completions";
 
@@ -49,139 +49,36 @@ public class OpenAiCompatProtocol implements LlmProtocol {
     @Override public boolean supportsTools() { return true; }
     @Override public boolean supportsStreaming() { return true; }
 
-    @Override
-    public void chatStream(ProtocolRequest request, ProtocolStreamListener listener) {
-        if (listener == null) throw new IllegalArgumentException("ProtocolStreamListener is required");
-        if (request == null) throw new LlmException("ProtocolRequest is required");
-        if (request.endpointUrl == null || request.endpointUrl.isBlank())
-            throw new LlmException("LLM endpoint url is required", LlmFinishReason.ERROR, 0, request.profileName);
-
-        request.stream = true;
-        String json = LlmJson.toJson(buildRequestBody(request));
-
-        RestClient restClient = newChatRestClient(request, json);
-        restClient.acceptContentType("text/event-stream");
-        // streamInternal rethrows TimeoutException, so header-timeout retry is Layer A here.
-        if (request.timeoutRetry) restClient.timeoutRetry(true);
-
-        StreamAssembler assembler = new StreamAssembler(request);
-        AtomicBoolean finished = new AtomicBoolean(false);
-        restClient.streamSse(new RestClient.SseConsumer() {
-            @Override public boolean onEvent(String event, String data, String id) {
-                assembler.accept(data, listener);
-                return true;
-            }
-            @Override public void onComplete() {
-                if (!finished.compareAndSet(false, true)) return;
-                // Clean EOF or [DONE] with tokens but no finish_reason is a truncated stream, not STOP.
-                if (assembler.hasUnfinishedOutput()) {
-                    listener.onFailure(new java.io.IOException("LLM stream ended without finish_reason"));
-                } else {
-                    listener.onComplete(assembler.toResult(200, null));
-                }
-            }
-            @Override public void onFailure(Throwable t) {
-                if (!finished.compareAndSet(false, true)) return;
-                int status = httpStatusOf(t);
-                if (status >= 400) {
-                    // Finished HTTP error (not a mid-body drop). Classify body the same as chat().
-                    listener.onComplete(assembler.toResult(status, t));
-                } else {
-                    listener.onFailure(t);
-                }
-            }
-        }, request.onStreamOpen);
-    }
+    @Override protected Map<String, Object> buildBody(ProtocolRequest request) { return buildRequestBody(request); }
 
     @Override
-    public ProtocolResult chat(ProtocolRequest request) {
-        if (request == null) throw new LlmException("ProtocolRequest is required");
-        if (request.endpointUrl == null || request.endpointUrl.isBlank())
-            throw new LlmException("LLM endpoint url is required", LlmFinishReason.ERROR, 0, request.profileName);
-
-        String json = LlmJson.toJson(buildRequestBody(request));
-        RestClient restClient = newChatRestClient(request, json);
-
-        RestClient.RestResponse response;
-        try {
-            response = restClient.call();
-        } catch (BaseException e) {
-            ProtocolResult err = new ProtocolResult(LlmFinishReason.ERROR);
-            err.errorMessage = e.getMessage();
-            // RestClient.callInternal wraps TimeoutException in BaseException, so
-            // RestClient.timeoutRetry never runs. Layer B owns timeout retry until that
-            // propagates. Do not also call timeoutRetry() here (would double-retry).
-            err.retryable = request.timeoutRetry && isTimeout(e);
-            if (logger.isDebugEnabled()) logger.debug("LLM HTTP call failed for profile " + request.profileName, e);
-            return err;
-        }
-
-        int status = response.getStatusCode();
-        String raw = response.text();
+    protected ProtocolResult parseResponse(int status, String raw, ProtocolRequest request) {
         ProtocolResult result = LlmRetryClassifier.classify(status, raw);
-        if (!request.logContent) result.rawJson = null;
-        else result.rawJson = raw;
-        if (result.model == null) result.model = request.model;
+        result.rawJson = request.logContent ? raw : null;
         return result;
     }
 
-    static RestClient newChatRestClient(ProtocolRequest request, String json) {
-        RestClient restClient = new RestClient()
-                .method(RestClient.POST)
-                .uri(request.endpointUrl)
-                .contentType("application/json")
-                .timeout(request.timeoutSeconds != null && request.timeoutSeconds > 0 ? request.timeoutSeconds : 120)
-                .retry(request.retryInitialSeconds > 0 ? request.retryInitialSeconds : 2.0f,
-                        request.retryMax >= 0 ? request.retryMax : 5)
-                .redactHeaders(redactHeaderNames(request))
-                .allowInSim(true)
-                .text(json);
-        if (request.requestFactory != null) restClient.withRequestFactory(request.requestFactory);
-        applyAuthAndHeaders(restClient, request);
-        return restClient;
-    }
-
-    static void applyAuthAndHeaders(RestClient restClient, ProtocolRequest request) {
-        for (Map.Entry<String, String> e : authHeaders(request).entrySet()) {
-            restClient.addHeader(e.getKey(), e.getValue());
-        }
-        if (request.extraHeaders != null) {
-            for (Map.Entry<String, String> e : request.extraHeaders.entrySet()) {
-                if (e.getKey() == null || e.getKey().isBlank() || e.getValue() == null) continue;
-                restClient.addHeader(e.getKey(), e.getValue());
+    @Override
+    protected StreamSession newStreamSession(ProtocolRequest request) {
+        StreamAssembler assembler = new StreamAssembler(request);
+        return new StreamSession() {
+            @Override public void accept(String event, String data, ProtocolStreamListener listener) {
+                assembler.accept(data, listener);
             }
-        }
-    }
-
-    /** Auth header only; empty when api-key is blank (no Authorization: Bearer ). */
-    public static Map<String, String> authHeaders(ProtocolRequest request) {
-        Map<String, String> headers = new LinkedHashMap<>();
-        if (request == null) return headers;
-        String apiKey = request.apiKey;
-        if (apiKey == null || apiKey.isBlank()) return headers;
-        String headerName = request.authHeaderName != null && !request.authHeaderName.isBlank()
-                ? request.authHeaderName : "Authorization";
-        String headerValue = request.authHeaderValue;
-        if (headerValue == null || headerValue.isBlank()) headerValue = "Bearer " + apiKey;
-        headers.put(headerName, headerValue);
-        return headers;
-    }
-
-    public static String[] redactHeaderNames(ProtocolRequest request) {
-        LinkedHashSet<String> names = new LinkedHashSet<>();
-        names.add("Authorization");
-        names.add("api-key");
-        names.add("x-api-key");
-        if (request != null && request.authHeaderName != null && !request.authHeaderName.isBlank())
-            names.add(request.authHeaderName);
-        return names.toArray(new String[0]);
+            @Override public void complete(ProtocolStreamListener listener) {
+                // Clean EOF or [DONE] with tokens but no finish_reason is a truncated stream, not STOP.
+                if (assembler.hasUnfinishedOutput()) listener.onFailure(new java.io.IOException("LLM stream ended without finish_reason"));
+                else listener.onComplete(assembler.toResult(200, null));
+            }
+            @Override public ProtocolResult httpError(int status, Throwable t) { return assembler.toResult(status, t); }
+        };
     }
 
     public static Map<String, Object> buildRequestBody(ProtocolRequest request) {
         Map<String, Object> body = new LinkedHashMap<>();
         if (request.extraBody != null) body.putAll(request.extraBody);
         if (request.model != null && !request.model.isBlank()) body.put("model", request.model);
-        body.put("messages", convertMessages(request.window));
+        body.put("messages", convertMessages(request.window, request));
         if (request.temperature != null) body.put("temperature", request.temperature);
         if (request.maxTokens != null) {
             String param = request.maxTokensParameter != null && !request.maxTokensParameter.isBlank()
@@ -224,10 +121,17 @@ public class OpenAiCompatProtocol implements LlmProtocol {
             }
             if (!toolList.isEmpty()) body.put("tools", toolList);
         }
+        LlmApiConfig.applyToBody(body, request.apiConfig);
+        // reasoning.effort (Responses shape) rejects temperature. reasoning_effort stays, so Qwen can send both.
+        LlmApiConfig.omitTemperatureForReasoningObject(body);
         return body;
     }
 
     public static List<Map<String, Object>> convertMessages(List<LlmMessage> window) {
+        return convertMessages(window, null);
+    }
+
+    public static List<Map<String, Object>> convertMessages(List<LlmMessage> window, ProtocolRequest request) {
         List<Map<String, Object>> out = new ArrayList<>();
         if (window == null) return out;
         for (LlmMessage msg : window) {
@@ -254,12 +158,21 @@ public class OpenAiCompatProtocol implements LlmProtocol {
                             tcm.put("type", "function");
                             Map<String, Object> fn = new LinkedHashMap<>();
                             fn.put("name", tc.name);
-                            fn.put("arguments", tc.arguments != null ? tc.arguments : "{}");
+                            fn.put("arguments", tc.arguments != null && !tc.arguments.isBlank() ? tc.arguments : "{}");
                             tcm.put("function", fn);
+                            if (tc.providerFields != null) {
+                                for (Map.Entry<String, Object> extra : tc.providerFields.entrySet()) {
+                                    if (extra.getKey() == null || extra.getValue() == null) continue;
+                                    String k = extra.getKey();
+                                    if ("id".equals(k) || "type".equals(k) || "function".equals(k)) continue;
+                                    tcm.put(k, extra.getValue());
+                                }
+                            }
                             tcs.add(tcm);
                         }
                         m.put("tool_calls", tcs);
                     }
+                    applyAssistantReplay(m, msg, request);
                     break;
                 case TOOL:
                     m.put("role", "tool");
@@ -273,7 +186,7 @@ public class OpenAiCompatProtocol implements LlmProtocol {
                     if (msg.metadata != null && msg.metadata.get("source") != null)
                         source = msg.metadata.get("source").toString();
                     m.put("content", "<untrusted-context source=\"" + escapeAttr(source) + "\">"
-                            + (msg.content != null ? msg.content : "") + "</untrusted-context>");
+                            + elideContextMarkers(msg.content) + "</untrusted-context>");
                     break;
                 default:
                     continue;
@@ -286,75 +199,52 @@ public class OpenAiCompatProtocol implements LlmProtocol {
     }
 
     /**
-     * Origin vs full-endpoint URL composition.
-     * If url contains '?' or a path other than empty/'/', treat as full endpoint (ignore path).
-     * Otherwise origin: strip trailing slash, append path (default /v1/chat/completions), append extra query.
+     * Echo reasoning_content and message extra_content. DeepSeek thinking mode 400s on the next tool
+     * turn when the key is missing, including turns that returned no reasoning text.
      */
-    public static String composeEndpointUrl(String url, String path, Map<String, String> extraQuery) {
-        if (url == null || url.isBlank()) throw new LlmException("LLM profile url is required");
-        String trimmed = url.trim();
-        String pathToUse = (path == null || path.isBlank()) ? DEFAULT_PATH : path.trim();
-        if (!pathToUse.startsWith("/")) pathToUse = "/" + pathToUse;
-
-        int qIdx = trimmed.indexOf('?');
-        String noQuery = qIdx >= 0 ? trimmed.substring(0, qIdx) : trimmed;
-        String existingQuery = qIdx >= 0 ? trimmed.substring(qIdx + 1) : "";
-
-        URI uri;
-        try {
-            uri = URI.create(noQuery);
-        } catch (Exception e) {
-            throw new LlmException("Unparseable LLM profile url: " + url, e);
+    static void applyAssistantReplay(Map<String, Object> m, LlmMessage msg, ProtocolRequest request) {
+        Map<String, Object> state = msg != null ? msg.providerState : null;
+        boolean hasReasoning = state != null && state.containsKey("reasoningContent");
+        if (hasReasoning) {
+            Object rc = state.get("reasoningContent");
+            m.put("reasoning_content", rc == null ? "" : rc.toString());
+        } else if (needsEmptyReasoning(m, request)) {
+            m.put("reasoning_content", "");
         }
-        String uriPath = uri.getRawPath();
-        boolean fullEndpoint = qIdx >= 0 || (uriPath != null && !uriPath.isEmpty() && !"/".equals(uriPath));
-
-        if (fullEndpoint) {
-            if (extraQuery == null || extraQuery.isEmpty()) return trimmed;
-            Set<String> existingNames = queryNames(existingQuery);
-            StringBuilder add = new StringBuilder();
-            for (Map.Entry<String, String> e : extraQuery.entrySet()) {
-                if (e.getKey() == null || e.getKey().isEmpty()) continue;
-                if (existingNames.contains(e.getKey())) continue;
-                add.append(add.length() == 0 && qIdx < 0 ? '?' : '&');
-                add.append(urlEncode(e.getKey())).append('=').append(urlEncode(e.getValue() != null ? e.getValue() : ""));
-            }
-            return add.length() == 0 ? trimmed : trimmed + add;
-        }
-
-        String origin = noQuery.endsWith("/") ? noQuery.substring(0, noQuery.length() - 1) : noQuery;
-        StringBuilder result = new StringBuilder(origin).append(pathToUse);
-        if (extraQuery != null && !extraQuery.isEmpty()) {
-            boolean first = true;
-            for (Map.Entry<String, String> e : extraQuery.entrySet()) {
-                if (e.getKey() == null || e.getKey().isEmpty()) continue;
-                result.append(first ? '?' : '&');
-                first = false;
-                result.append(urlEncode(e.getKey())).append('=').append(urlEncode(e.getValue() != null ? e.getValue() : ""));
+        Object extras = state != null ? state.get("messageExtras") : null;
+        if (extras instanceof Map) {
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) extras).entrySet()) {
+                if (e.getKey() == null || e.getValue() == null) continue;
+                String k = e.getKey().toString();
+                if ("role".equals(k) || "content".equals(k) || "tool_calls".equals(k) || "reasoning_content".equals(k))
+                    continue;
+                m.put(k, e.getValue());
             }
         }
-        return result.toString();
     }
 
-    static Set<String> queryNames(String query) {
-        Set<String> names = new LinkedHashSet<>();
-        if (query == null || query.isEmpty()) return names;
-        String[] parts = query.split("&");
-        for (String part : parts) {
-            if (part.isEmpty()) continue;
-            int eq = part.indexOf('=');
-            String name = eq >= 0 ? part.substring(0, eq) : part;
-            if (!name.isEmpty()) names.add(name);
-        }
-        return names;
+    static boolean needsEmptyReasoning(Map<String, Object> message, ProtocolRequest request) {
+        if (request == null || request.tools == null || request.tools.isEmpty()) return false;
+        if (message == null || !(message.get("tool_calls") instanceof List) || ((List<?>) message.get("tool_calls")).isEmpty())
+            return false;
+        return thinkingEnabled(request.apiConfig);
     }
 
-    static String urlEncode(String s) {
-        try {
-            return URLEncoder.encode(s, StandardCharsets.UTF_8.name()).replace("+", "%20");
-        } catch (UnsupportedEncodingException e) {
-            return s;
-        }
+    static boolean thinkingEnabled(Map<String, Object> apiConfig) {
+        if (apiConfig == null) return false;
+        Object thinking = apiConfig.get("thinking");
+        if (!(thinking instanceof Map)) return false;
+        Object type = ((Map<?, ?>) thinking).get("type");
+        return type != null && "enabled".equalsIgnoreCase(type.toString().trim());
+    }
+
+    static final String CONTEXT_ELIDED = "[elided-context-marker]";
+
+    /** Replace wrapper markers inside a context body so the payload cannot close the wrapper early. */
+    static String elideContextMarkers(String text) {
+        if (text == null || text.isEmpty()) return "";
+        return text.replace("</untrusted-context>", CONTEXT_ELIDED)
+                .replace("<untrusted-context", CONTEXT_ELIDED);
     }
 
     static String escapeAttr(String s) {
@@ -362,49 +252,15 @@ public class OpenAiCompatProtocol implements LlmProtocol {
         return s.replace("&", "&amp;").replace("\"", "&quot;").replace("<", "&lt;");
     }
 
-    static boolean isTimeout(Throwable t) {
-        while (t != null) {
-            if (t instanceof java.util.concurrent.TimeoutException) return true;
-            String msg = t.getMessage();
-            if (msg != null && msg.toLowerCase().contains("timeout")) return true;
-            t = t.getCause();
-        }
-        return false;
-    }
-
-    static int httpStatusOf(Throwable t) {
-        Throwable cur = t;
-        while (cur != null) {
-            if (cur instanceof RestClient.HttpErrorException) {
-                int status = ((RestClient.HttpErrorException) cur).getStatusCode();
-                if (status > 0) return status;
-            }
-            if (cur instanceof HttpResponseException) {
-                Response resp = ((HttpResponseException) cur).getResponse();
-                if (resp != null && resp.getStatus() > 0) return resp.getStatus();
-            }
-            cur = cur.getCause();
-        }
-        return 0;
-    }
-
-    static String errorBodyOf(Throwable t) {
-        Throwable cur = t;
-        while (cur != null) {
-            if (cur instanceof RestClient.HttpErrorException) {
-                return ((RestClient.HttpErrorException) cur).getResponseText();
-            }
-            cur = cur.getCause();
-        }
-        return null;
-    }
-
     /** Concatenate content and tool_call arguments by index; usage may arrive after finish_reason. */
     static final class StreamAssembler {
+        private final ProtocolRequest request;
         private final String requestModel;
         private final boolean logContent;
         private final StringBuilder content = new StringBuilder();
         private final StringBuilder reasoning = new StringBuilder();
+        private boolean sawReasoningKey;
+        private Object messageExtra;
         private final TreeMap<Integer, ToolCallAcc> toolCalls = new TreeMap<>();
         private final Map<String, Integer> toolCallIdToIndex = new LinkedHashMap<>();
         private String finishReason;
@@ -413,6 +269,7 @@ public class OpenAiCompatProtocol implements LlmProtocol {
         private Map<String, Object> error;
 
         StreamAssembler(ProtocolRequest request) {
+            this.request = request;
             this.requestModel = request != null ? request.model : null;
             this.logContent = request != null && request.logContent;
         }
@@ -465,11 +322,15 @@ public class OpenAiCompatProtocol implements LlmProtocol {
                     if (listener != null) listener.onDelta(s);
                 }
             }
-            String think = LlmRetryClassifier.reasoningOf(delta);
-            if (think != null && !think.isEmpty()) {
-                reasoning.append(think);
-                if (listener != null) listener.onReasoningDelta(think);
+            if (delta.containsKey("reasoning_content")) {
+                sawReasoningKey = true;
+                Object raw = delta.get("reasoning_content");
+                if (raw != null) reasoning.append(raw.toString());
+            } else {
+                String think = LlmRetryClassifier.reasoningOf(delta);
+                if (think != null && !think.isEmpty()) reasoning.append(think);
             }
+            if (delta.get("extra_content") != null) messageExtra = delta.get("extra_content");
 
             Object tcs = delta.get("tool_calls");
             if (tcs instanceof List) {
@@ -501,6 +362,11 @@ public class OpenAiCompatProtocol implements LlmProtocol {
             }
 
             ToolCallAcc acc = toolCalls.get(idx);
+            // Some servers reuse index 0 for every parallel call and tell them apart only by id
+            if (acc != null && hasId && acc.id != null && !acc.id.equals(id)) {
+                idx = toolCalls.lastKey() + 1;
+                acc = null;
+            }
             if (acc == null) {
                 acc = new ToolCallAcc();
                 toolCalls.put(idx, acc);
@@ -512,13 +378,18 @@ public class OpenAiCompatProtocol implements LlmProtocol {
             Map<?, ?> fn = LlmRetryClassifier.asMap(tc.get("function"));
             String name = fn != null ? LlmRetryClassifier.str(fn.get("name")) : LlmRetryClassifier.str(tc.get("name"));
             if (name != null && !name.isBlank()) acc.name = name;
+            Map<String, Object> extras = LlmRetryClassifier.providerFieldsOf(tc);
+            if (extras != null) {
+                if (acc.extras == null) acc.extras = new LinkedHashMap<>();
+                acc.extras.putAll(extras);
+            }
             Object argsObj = fn != null ? fn.get("arguments") : tc.get("arguments");
             if (argsObj instanceof CharSequence) {
                 acc.arguments.append(argsObj);
             } else if (argsObj != null && acc.arguments.length() == 0) {
                 acc.arguments.append(LlmJson.toJson(argsObj));
             }
-            if (listener != null && "write_ui".equals(acc.name) && acc.arguments.length() - acc.lastDeltaLen >= 48) {
+            if (listener != null && streamsPartialArguments(request, acc.name) && acc.arguments.length() - acc.lastDeltaLen >= 48) {
                 acc.lastDeltaLen = acc.arguments.length();
                 listener.onToolCallDelta(acc.name, acc.arguments.toString());
             }
@@ -546,7 +417,9 @@ public class OpenAiCompatProtocol implements LlmProtocol {
             if (finishReason != null) choice.put("finish_reason", finishReason);
             Map<String, Object> message = new LinkedHashMap<>();
             message.put("content", content.length() == 0 ? null : content.toString());
-            if (reasoning.length() > 0) message.put("reasoning_content", reasoning.toString());
+            if (sawReasoningKey) message.put("reasoning_content", reasoning.toString());
+            else if (reasoning.length() > 0) message.put("reasoning_content", reasoning.toString());
+            if (messageExtra != null) message.put("extra_content", messageExtra);
             if (!toolCalls.isEmpty()) message.put("tool_calls", toolCallsAsOpenAi());
             choice.put("message", message);
             choices.add(choice);
@@ -569,6 +442,7 @@ public class OpenAiCompatProtocol implements LlmProtocol {
                 fn.put("name", acc.name);
                 fn.put("arguments", acc.arguments.toString());
                 tc.put("function", fn);
+                if (acc.extras != null) tc.putAll(acc.extras);
                 out.add(tc);
             }
             return out;
@@ -578,6 +452,7 @@ public class OpenAiCompatProtocol implements LlmProtocol {
     static final class ToolCallAcc {
         String id;
         String name;
+        Map<String, Object> extras;
         final StringBuilder arguments = new StringBuilder();
         int lastDeltaLen = 0;
     }

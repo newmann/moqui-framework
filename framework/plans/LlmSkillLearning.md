@@ -4,7 +4,7 @@
 
 Shipped on `llm-client`: shipped `skill/*.md` plus `LlmSkill` rows, `find_skill`, prompt inject of active and shipped skills, HOLD `TransactionCacheDb`, `enter_sim`, and fences for email, `RestClient`, async, jobs, raw JDBC, file/JCR writes, and print. A proposed skill cannot take a shipped or active human/world name. It is promoted only after that name is selected and a later server-side world write succeeds. Resume payloads do not promote.
 
-Not what this document originally specified: `LlmLesson` is unused, success criteria are not checked, and overlay find SQL still uses the production database's limit/offset and join style. What did ship beyond the first cut: world-rim `run_service` and mutating `request` follow `risk` (no skill refuses them, `reversible` runs, `confirm` and `irreversible` wait for a click; sim does not), and overlay column names use the H2 `name-replace` list. FLUSH exists. `enter_sim` uses HOLD only. Force Skill Use stays opt-in.
+Not what this document originally specified: success criteria are not checked, and overlay find SQL still uses the production database's limit/offset and join style. `LlmLesson` is written by `SkillIndex.recordOutcome` as a failure note on the skill, and inject and `find_skill` attach up to three lessons. It is not cross-session memory. What did ship beyond the first cut: world-rim `run_service` and mutating `request` follow `risk` (no skill refuses them, `reversible` runs, `confirm` and `irreversible` wait for a click; sim does not), and overlay column names use the H2 `name-replace` list. FLUSH exists. `enter_sim` uses HOLD only. Force Skill Use stays opt-in.
 
 The PR plan below is historical.
 
@@ -62,7 +62,7 @@ Already on `llm-client`:
 - `LlmClient` / `LlmAgentLoop` sequential tool loop
 - Tools: `request` (ScreenRender, authz on), `run_service`, `browse`, `write_ui`
 - Conversations: `LlmConversation` / `LlmMessage` / `LlmCallLog`
-- Assist profile (`component://tools/prompt/AssistSystem.ftl`) currently **inlines** the playbooks (create user, sales order). Those *are* skills stuck in the system prompt.
+- Assist profile (`component://webroot/prompt/AssistSystem.ftl`) currently **inlines** the playbooks (create user, sales order). Those *are* skills stuck in the system prompt.
 - `TransactionCache` — per-JTA-TX map overlay (`Synchronization.flush` on commit). Documented holes: view-entities, counts, DB limit, some iterators. This is the shape to extend, not the sim itself.
 - `ArtifactExecutionFacade` already has `disableEntityEca`, `disableEntityDataFeed`, `disableAuthz`, audit-log disable.
 - `sequencedIdPrimary` banks IDs in `runRequireNew` against `SequenceValueItem` — a sim that calls this **burns production sequences**.

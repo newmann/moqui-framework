@@ -104,12 +104,18 @@ def login(driver):
 
 
 def goto_assist(driver):
-    driver.get(BASE + "/qapps/assist")
+    # Assist is a shell panel on every /qapps page, not a screen of its own.
+    driver.get(BASE + "/qapps")
     wait_js(
         driver,
-        "!!document.querySelector('.assist-root')",
-        msg="Assist Vue root did not mount at /qapps/assist",
+        "!!document.querySelector('.assist-root') && !!window.moquiAssistVm",
+        msg="Assist panel did not mount on /qapps (needs the LlmGateway permission and confAssist=true)",
     )
+    js(driver, "var rv = window.moqui && moqui.webrootVue; if (rv && !rv.assistOpen) rv.toggleAssist(); return 1;")
+    wait_js(driver, "document.querySelectorAll('.assist-chat .text-caption').length > 0",
+            msg="Assist panel did not open")
+    # The canvas runtime loads lazily on the first openui canvas. Load it now.
+    js(driver, "window.moquiAssistVm.ensureOpenUiRuntime(true); return 1;")
     wait_js(
         driver,
         "!!(window.OpenUILang && window.AssistOpenUiLibrary && window.AssistOpenUiNav && window.AssistOpenUiReady)",
@@ -401,6 +407,302 @@ def case_unknown():
     return {"id": "unknown", "title": "Unknown", "lang": lang, "check": chk}
 
 
+# --- Assist chat thread / canvas chrome (no LLM needed, drives the Vue component directly) ---
+
+# Same lookup as FIND_ASSIST but leaves the component in `vm` so callers can append code.
+ASSIST_VM = r"""
+function findYield(vm, depth) {
+    if (!vm || depth > 20) return null;
+    if (typeof vm.applyYield === 'function') return vm;
+    var ch = vm.$children || [];
+    for (var i = 0; i < ch.length; i++) {
+        var f = findYield(ch[i], depth + 1);
+        if (f) return f;
+    }
+    return null;
+}
+var root = (window.moqui && moqui.webrootVue) || (document.querySelector('#apps-root') && document.querySelector('#apps-root').__vue__);
+var vm = findYield(root, 0);
+"""
+
+CHAT_MD = (
+    "# head\n\n"
+    '<script>alert(1)</script>\n\n<img src=x onerror=alert(2)>\n\n'
+    "**bold** and `code`\n\n"
+    "```java\nint x = 1;\n```\n\n"
+    "[ok](/qapps/assist)\n"
+)
+
+
+def push_message(driver, msg):
+    return js(
+        driver,
+        ASSIST_VM
+        + "\nvm.$set(vm, 'messages', (vm.messages || []).concat([arguments[0]])); return 'ok';",
+        msg,
+    )
+
+
+def case_chat_markdown():
+    def chk(d, info):
+        oks = []
+        js(d, ASSIST_VM + "\nvm.$set(vm, 'messages', []); vm.$set(vm, 'openUiRuntimeReady', false); return 1;")
+        push_message(d, {"role": "assistant", "content": CHAT_MD})
+        time.sleep(0.6)
+        html = js(d, "var el=document.querySelector('.assist-md-fallback'); return el ? el.innerHTML : '';") or ""
+        low = html.lower()
+        oks.append(check("fallback renders markdown", "<strong>bold</strong>" in low, html[:300]))
+        oks.append(check("fallback code fence", "<pre>" in low, html[:300]))
+        # Escape-then-tag: the payloads survive as text, never as markup.
+        oks.append(check("fallback XSS escaped", "<script" not in low and "<img" not in low and "&lt;script&gt;" in low, html[:300]))
+
+        # The library renderer is DOM based: marked + DOMPurify, then links get target/rel.
+        js(d, ASSIST_VM + "\nvm.$set(vm, 'openUiRuntimeReady', true); return 1;")
+        end = time.time() + 25
+        html = ""
+        while time.time() < end:
+            html = js(d, "var el=document.querySelector('.assist-md'); return el ? el.innerHTML : '';") or ""
+            if "<pre" in html.lower():
+                break
+            time.sleep(0.3)
+        low = html.lower()
+        oks.append(check("assist-markdown component rendered", "<pre" in low and "bold" in low, html[:300]))
+        oks.append(check("markdown XSS stripped (DOMPurify)", "<script" not in low and "onerror" not in low, html[:300]))
+        oks.append(check("markdown link rewritten for target", 'target="_blank"' in low, html[:400]))
+        oks.append(check("fallback markup gone", not js(d, "return !!document.querySelector('.assist-md-fallback');"), "both branches rendered"))
+        return oks
+
+    return {"id": "chat-markdown", "title": "Chat markdown", "lang": "root = Stack([])\n", "check": chk}
+
+
+def case_chat_tool_row():
+    def chk(d, info):
+        oks = []
+        js(d, ASSIST_VM + "\nvm.$set(vm, 'messages', []); return 1;")
+        push_message(d, {"role": "tool", "kind": "call", "name": "request",
+                         "arguments": '{"method":"POST","path":"/x","body":{"password":"hunter2"}}'})
+        rows = js(d, "return document.querySelectorAll('.assist-tool-row').length;")
+        oks.append(check("tool row rendered", rows == 1, "rows=%s" % rows))
+        oks.append(check("detail collapsed by default",
+                         not js(d, "return !!document.querySelector('.assist-source-pre');"), "detail open on load"))
+        js(d, "document.querySelector('.assist-tool-row').click(); return 1;")
+        time.sleep(0.3)
+        pre = js(d, "var el=document.querySelector('.assist-source-pre'); return el ? el.textContent : '';") or ""
+        oks.append(check("click expands tool detail", '"path": "/x"' in pre, pre[:200]))
+        oks.append(check("tool detail redacts secrets", "hunter2" not in pre and '"password": "***"' in pre, pre[:200]))
+        oks.append(check("row marked expanded",
+                         js(d, "var el=document.querySelector('.assist-tool-row'); return el.getAttribute('aria-expanded');") == "true", "aria-expanded"))
+        # keyboard: Enter toggles the same detail
+        js(d, "document.querySelector('.assist-source-pre').remove(); "
+              "document.querySelector('.assist-tool-row').dispatchEvent("
+              "new KeyboardEvent('keyup', {key: 'Enter', bubbles: true})); return 1;")
+        time.sleep(0.3)
+        oks.append(check("Enter toggles tool detail",
+                         not js(d, "return !!document.querySelector('.assist-source-pre');"), "keyboard did not collapse"))
+        return oks
+
+    return {"id": "chat-tool-row", "title": "Tool detail", "lang": "root = Stack([])\n", "check": chk}
+
+
+def case_result_links():
+    def chk(d, info):
+        oks = []
+        apply_lang(d, "root = Stack([txt])\ntxt = TextContent('canvas ready')\n", "Result links")
+        js(d, ASSIST_VM + "\nvm.$set(vm, 'lastActionResults', arguments[0]); return 1;", [
+            {"id": "create", "status": 200, "body": {"screenUrl": "/apps/Order/Edit"}},
+            {"id": "bad", "status": 200, "body": {"screenUrl": "//evil.example.com/x"}},
+            {"id": "skipped", "skipped": True, "body": {"screenUrl": "/apps/No/Edit"}},
+            {"id": "failed", "error": "boom", "body": {"screenUrl": "/apps/No/Edit2"}},
+            {"id": "list", "status": 200, "body": {"redirectUrl": "/apps/Order/List?page=2"}},
+        ])
+        time.sleep(0.5)
+        labels = js(d, "var els=document.querySelectorAll('#assist-result-links .q-btn');"
+                       "var out=[]; for (var i=0;i<els.length;i++) out.push(els[i].innerText.trim()); return out;") or []
+        hrefs = js(d, ASSIST_VM + "return (vm.resultLinks || []).map(function(r) { return r.href; });") or []
+        # innerText also carries the q-icon ligature, so match on the tail of each label.
+        oks.append(check("only valid result links shown",
+                         len(labels) == 2 and labels[0].endswith("Open Edit") and labels[1].endswith("Open List"),
+                         "labels=%s" % labels))
+        oks.append(check("no off-origin result link",
+                         all("evil.example.com" not in (h or "") for h in hrefs), "hrefs=%s" % hrefs))
+        # Regression: the write_ui yield that follows a submit must not clear the links.
+        apply_lang(d, "root = Stack([txt])\ntxt = TextContent('revised canvas')\n", "Result links")
+        time.sleep(0.4)
+        after = js(d, "return document.querySelectorAll('#assist-result-links .q-btn').length;") or 0
+        oks.append(check("links survive the next write_ui yield", after == 2, "count=%s after=%s" % (len(labels), after)))
+        return oks
+
+    return {"id": "result-links", "title": "Result links", "lang": "root = Stack([])\n", "check": chk}
+
+
+def case_session_stats():
+    def chk(d, info):
+        oks = []
+        js(d, ASSIST_VM + "\nvm.$set(vm, 'messages', []); vm.sessionTurns = 0; vm.sessionTokens = 0; return 1;")
+        js(d, ASSIST_VM + "\nvm.recordDoneStats({usage:{promptTokens:5, completionTokens:5, totalTokens:10}});"
+                         "vm.recordDoneStats({usage:{promptTokens:5, completionTokens:5, totalTokens:10}}); return 1;")
+        time.sleep(0.3)
+        header = js(d, "var els=document.querySelectorAll('.assist-chat .text-caption');"
+                       "for (var i=0;i<els.length;i++) { if (els[i].innerText.indexOf('turn') >= 0) return els[i].innerText.trim(); }"
+                       "return '';") or ""
+        oks.append(check("turn/token totals", "2 turns" in header and "20" in header, header[:120]))
+        js(d, ASSIST_VM + "\nvm.recordDoneStats({usage:{promptTokens:1, completionTokens:2}}); return 1;")
+        time.sleep(0.3)
+        header = js(d, "var els=document.querySelectorAll('.assist-chat .text-caption');"
+                       "for (var i=0;i<els.length;i++) { if (els[i].innerText.indexOf('turn') >= 0) return els[i].innerText.trim(); }"
+                       "return '';") or ""
+        oks.append(check("usage without totalTokens", "3 turns" in header and "23" in header, header[:120]))
+        # A restored conversation counts user turns, not history rows.
+        js(d, ASSIST_VM + "\nvm.restoreConversation({conversationId: 'smoke-restore-conv',"
+                          " history: [{role:'user', content:'a'}, {role:'assistant', content:'b'},"
+                          " {role:'user', content:'c'}, {role:'assistant', content:'d'},{role:'user', content:'e'}],"
+                          " pendingToolCalls: [], canvas: {kind:'openui', title:'restored',"
+                          " lang:'root = Stack([txt])\\ntxt = TextContent(\\'restored\\')\\n'}}); return 1;")
+        time.sleep(0.5)
+        header = js(d, "var els=document.querySelectorAll('.assist-chat .text-caption');"
+                       "for (var i=0;i<els.length;i++) { if (els[i].innerText.indexOf('turn') >= 0) return els[i].innerText.trim(); }"
+                       "return '';") or ""
+        oks.append(check("restored conversation counts user turns", "3 turns" in header, header[:120]))
+        js(d, "try { sessionStorage.removeItem('assist.conversationId'); } catch (e) { } return 1;")
+        return oks
+
+    return {"id": "session-stats", "title": "Session stats", "lang": "root = Stack([])\n", "check": chk}
+
+
+OPENUI_VM = r"""
+var el = document.querySelector('.assist-openui');
+var ovm = el && el.__vue__;
+while (ovm && ovm.$options && ovm.$options.name !== 'assist-openui') ovm = ovm.$parent;
+"""
+
+
+def settle(d, script, *args):
+    """Run an async snippet that ends in `done(value)` and return the value."""
+    return d.execute_async_script(script, *args)
+
+
+def case_markdown_exfil():
+    lang = ('root = Stack([md])\n'
+            'md = MarkDownRenderer("![beacon](/apps/system/dashboard/actions)\\n\\n'
+            '<img src=\\"https://evil.example.com/p.png\\" srcset=\\"https://evil.example.com/a.png 1x\\">\\n\\n'
+            '<video poster=\\"https://evil.example.com/v.png\\" src=\\"https://evil.example.com/v.mp4\\"></video>\\n\\n'
+            '<picture><source srcset=\\"https://evil.example.com/s.png\\"></picture>\\n\\nplain **text**")\n')
+
+    def chk(d, info):
+        end = time.time() + 20
+        html = ""
+        while time.time() < end:
+            html = js(d, "var el=document.querySelector('.assist-openui .openui-md'); return el ? el.innerHTML : '';") or ""
+            if html.strip():
+                break
+            time.sleep(0.3)
+        low = html.lower()
+        return [
+            check("markdown still renders text", "<strong>" in low, html[:300]),
+            check("no img/video/picture/source tags", not any(t in low for t in ("<img", "<video", "<picture", "<source", "<audio")), html[:300]),
+            check("no srcset or poster attributes", "srcset" not in low and "poster" not in low, html[:300]),
+            check("no external URL left in markdown", "evil.example.com" not in low, html[:300]),
+        ]
+    return {"id": "markdown-exfil", "title": "Markdown exfil", "lang": lang, "check": chk}
+
+
+def case_query_write_gate():
+    def chk(d, info):
+        oks = []
+        # A Query that runs on render never carries the click nonce, so a write must be refused before any fetch.
+        r = settle(d, OPENUI_VM + """
+            var done = arguments[arguments.length - 1];
+            if (!ovm) return done({err: 'no assist-openui vm'});
+            ovm.mode = 'script';
+            ovm.callRequest({method: 'POST', path: '/apps/system/dashboard/noSuchTransition', body: {}})
+                .then(function() { done({ok: true}); }, function(e) { done({err: String(e && e.message || e)}); });
+        """)
+        oks.append(check("Query write without a click is refused", bool(r) and "user action" in str(r.get("err", "")), str(r)))
+        # A read still works.
+        r = settle(d, OPENUI_VM + """
+            var done = arguments[arguments.length - 1];
+            ovm.callRequest({method: 'GET', path: '/apps/system/dashboard/actions'})
+                .then(function(v) { done({ok: true, type: typeof v}); }, function(e) { done({err: String(e && e.message || e)}); });
+        """)
+        oks.append(check("Query GET still works", bool(r) and r.get("ok") is True, str(r)))
+        # With the nonce a write passes the gate. The path is bogus, so the server rejects it for another reason.
+        r = settle(d, OPENUI_VM + """
+            var done = arguments[arguments.length - 1];
+            var n = ovm.armGesture();
+            ovm.callRequest({method: 'POST', path: '/apps/system/dashboard/noSuchTransition', body: {}, __gesture: n})
+                .then(function() { done({ok: true}); }, function(e) { done({err: String(e && e.message || e), nonce: n}); });
+        """)
+        err = str(r.get("err", "")) if r else ""
+        oks.append(check("click nonce passes the write gate", bool(r) and "user action" not in err, str(r)))
+        # The nonce is single use.
+        r = settle(d, OPENUI_VM + """
+            var done = arguments[arguments.length - 1];
+            var n = ovm.armGesture();
+            ovm.callRequest({method: 'POST', path: '/apps/system/dashboard/noSuchTransition', body: {}, __gesture: n})
+                .catch(function() {}).then(function() {
+                    return ovm.callRequest({method: 'POST', path: '/apps/system/dashboard/noSuchTransition', body: {}, __gesture: n});
+                }).then(function() { done({ok: true}); }, function(e) { done({err: String(e && e.message || e)}); });
+        """)
+        oks.append(check("nonce cannot be replayed", bool(r) and "user action" in str(r.get("err", "")), str(r)))
+        # A model cannot guess a nonce.
+        r = settle(d, OPENUI_VM + """
+            var done = arguments[arguments.length - 1];
+            ovm.callRequest({method: 'DELETE', path: '/apps/system/dashboard/noSuchTransition', __gesture: 'guess'})
+                .then(function() { done({ok: true}); }, function(e) { done({err: String(e && e.message || e)}); });
+        """)
+        oks.append(check("guessed nonce is refused", bool(r) and "user action" in str(r.get("err", "")), str(r)))
+        return oks
+    return {"id": "query-write-gate", "title": "Query write gate", "lang": "root = Stack([])\n", "check": chk}
+
+
+def case_sfc_flag():
+    def chk(d, info):
+        r = js(d, ASSIST_VM + """
+            var before = {loaded: vm.profilesLoaded, flags: vm.profileFlags};
+            vm.profilesLoaded = true; vm.profileFlags = Object.assign({}, vm.profileFlags, {allowVueSfc: false});
+            vm.vueSfcComp = null; vm.vueSfcFailed = false;
+            vm.loadVueSfc({kind: 'vue-sfc', template: '<div id="sfc-should-not-render">x</div>', script: 'module.exports = {}'});
+            var out = {failed: vm.vueSfcFailed, comp: !!vm.vueSfcComp};
+            vm.profilesLoaded = before.loaded; vm.profileFlags = before.flags;
+            return out;
+        """)
+        return [check("vue-sfc refused when the profile disallows it", bool(r) and r.get("failed") is True and r.get("comp") is False, str(r))]
+    return {"id": "sfc-flag", "title": "SFC flag", "lang": "root = Stack([])\n", "check": chk}
+
+
+def case_mutation_click():
+    lang = ('root = Stack([btn, q])\n'
+            'q = Query("request", {method:"POST", path:"/apps/system/dashboard/noSuchTransition", body:{from:"query"}}, {})\n'
+            'res = Mutation("request", {method:"POST", path:"/apps/system/dashboard/noSuchTransition", body:{from:"click"}})\n'
+            'btn = Button("Go", Action([@Run(res)]))\n')
+
+    def chk(d, info):
+        oks = []
+        # Record every POST the page sends from now on.
+        js(d, """
+            if (!window.__posts) {
+                window.__posts = [];
+                var of = window.fetch;
+                window.fetch = function(u, i) {
+                    if (i && i.method && i.method.toUpperCase() !== 'GET') window.__posts.push({url: String(u), body: i.body});
+                    return of.apply(this, arguments);
+                };
+            }
+            window.__posts.length = 0; return 1;
+        """)
+        time.sleep(1.5)  # the Query above is evaluated on render
+        before = js(d, "return window.__posts.slice();") or []
+        oks.append(check("Query with POST did not hit the server on render", not before, str(before)))
+        js(d, "var b=[].filter.call(document.querySelectorAll('.assist-openui button'),function(x){return /Go/.test(x.innerText)})[0]; b.click(); return 1;")
+        time.sleep(1.5)
+        after = js(d, "return window.__posts.slice();") or []
+        click_posts = [p for p in after if "click" in str(p.get("body"))]
+        oks.append(check("click-fired Mutation POST reaches the server", len(click_posts) == 1, str(after)))
+        oks.append(check("nonce is not sent to the server", not any("__gesture" in str(p.get("body")) for p in after), str(after)))
+        return oks
+    return {"id": "mutation-click", "title": "Mutation click", "lang": lang, "check": chk}
+
+
 def main():
     os.makedirs(SHOT_DIR, exist_ok=True)
     driver, browser = make_driver()
@@ -421,6 +723,14 @@ def main():
             case_mermaid(),
             case_layout_forms(),
             case_unknown(),
+            case_chat_markdown(),
+            case_chat_tool_row(),
+            case_result_links(),
+            case_session_stats(),
+            case_markdown_exfil(),
+            case_query_write_gate(),
+            case_sfc_flag(),
+            case_mutation_click(),
         ]
         for c in cases:
             print("---", c["id"], "---")

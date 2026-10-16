@@ -19,6 +19,7 @@ import org.moqui.llm.LlmToolCall;
 import org.moqui.llm.LlmUsage;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -29,7 +30,8 @@ import java.util.regex.Pattern;
  */
 public final class LlmRetryClassifier {
     private static final Pattern CONTEXT_OVERFLOW_MSG =
-            Pattern.compile("context length|maximum context|too many tokens", Pattern.CASE_INSENSITIVE);
+            Pattern.compile("context length|maximum context|too many tokens|prompt is too long"
+                    + "|input token count|exceeds the (maximum|context)|context window", Pattern.CASE_INSENSITIVE);
 
     private LlmRetryClassifier() { }
 
@@ -79,8 +81,12 @@ public final class LlmRetryClassifier {
         result.content = content;
         result.toolCalls = toolCalls;
         result.reasoning = reasoningOf(message);
+        result.providerState = providerStateOf(message);
 
-        String overflowHaystack = joinNonNull(errorCode, errorType, errorMessage, rawJson);
+        // The raw body only counts when the provider sent no structured error, because a 400 can echo
+        // user text that happens to contain a phrase like "too many tokens"
+        String overflowHaystack = errorMessage != null || errorCode != null
+                ? joinNonNull(errorCode, errorType, errorMessage) : joinNonNull(errorType, rawJson);
 
         // 1. CONTEXT_OVERFLOW
         if (httpStatus == 400 || httpStatus == 413) {
@@ -108,6 +114,14 @@ public final class LlmRetryClassifier {
         if ("tool_calls".equalsIgnoreCase(finishReasonStr) || "function_call".equalsIgnoreCase(finishReasonStr)
                 || hasToolCalls) {
             result.finishReason = LlmFinishReason.TOOL_CALLS;
+            return result;
+        }
+
+        // 4b. A model refusal has no content and would otherwise be retried as EMPTY. Surface it as a filter result.
+        String refusal = message != null ? str(message.get("refusal")) : null;
+        if (refusal != null && !refusal.isBlank() && (content == null || content.isBlank()) && !hasToolCalls) {
+            result.finishReason = LlmFinishReason.CONTENT_FILTER;
+            result.content = refusal;
             return result;
         }
 
@@ -184,9 +198,41 @@ public final class LlmRetryClassifier {
             if (argsObj == null) args = null;
             else if (argsObj instanceof CharSequence) args = argsObj.toString();
             else args = LlmJson.toJson(argsObj);
-            out.add(new LlmToolCall(id, name, args));
+            LlmToolCall call = new LlmToolCall(id, name, args);
+            Map<String, Object> extras = providerFieldsOf(tc);
+            if (extras != null) call.providerFields = extras;
+            out.add(call);
         }
         return out.isEmpty() ? null : out;
+    }
+
+    /** Replay bag from a Chat Completions message. Empty string reasoning_content is kept. */
+    static Map<String, Object> providerStateOf(Map<?, ?> message) {
+        if (message == null) return null;
+        Map<String, Object> state = new LinkedHashMap<>();
+        if (message.containsKey("reasoning_content")) {
+            Object raw = message.get("reasoning_content");
+            state.put("reasoningContent", raw == null ? "" : raw.toString());
+        }
+        if (message.get("extra_content") != null) {
+            Map<String, Object> extras = new LinkedHashMap<>();
+            extras.put("extra_content", message.get("extra_content"));
+            state.put("messageExtras", extras);
+        }
+        return state.isEmpty() ? null : state;
+    }
+
+    /** Tool-call fields other than id, type, function, and the stream-only index. */
+    static Map<String, Object> providerFieldsOf(Map<?, ?> tc) {
+        if (tc == null) return null;
+        Map<String, Object> extras = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> e : tc.entrySet()) {
+            if (e.getKey() == null || e.getValue() == null) continue;
+            String k = e.getKey().toString();
+            if ("id".equals(k) || "type".equals(k) || "function".equals(k) || "index".equals(k)) continue;
+            extras.put(k, e.getValue());
+        }
+        return extras.isEmpty() ? null : extras;
     }
 
     static LlmUsage parseUsage(Map<?, ?> usage) {

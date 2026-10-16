@@ -44,10 +44,19 @@ public final class FtsDdl {
     }
 
     public static void ensure(EntityFacadeImpl efi, EntityDefinition ed) {
-        ensure(efi, ed, null);
+        ensure(efi, ed, null, false);
     }
 
     public static void ensure(EntityFacadeImpl efi, EntityDefinition ed, Connection sharedCon) {
+        ensure(efi, ed, sharedCon, false);
+    }
+
+    /**
+     * @param columnsChanged true when columns were just added to this table. An H2 full-text index keeps the table's
+     * old column list in its trigger, so after an ALTER TABLE ADD COLUMN every find on the table fails until the index
+     * is dropped and built again.
+     */
+    public static void ensure(EntityFacadeImpl efi, EntityDefinition ed, Connection sharedCon, boolean columnsChanged) {
         if (efi == null || ed == null || ed.isViewEntity) return;
         List<FieldInfo> fields = ftsFields(ed);
         if (fields.isEmpty()) return;
@@ -56,27 +65,37 @@ public final class FtsDdl {
         if (databaseNode == null) return;
         String style = databaseNode.attribute("fts-style");
         if (style == null || style.isEmpty() || "none".equals(style) || FtsSql.isDisabled(groupName)) return;
+        // fts-ddl="false" leaves the columns and indexes to a DBA. Searches still use the fts-style predicate.
+        if ("false".equals(databaseNode.attribute("fts-ddl"))) return;
         Connection con = sharedCon;
         boolean close = false;
         boolean began = false;
+        java.sql.Savepoint savepoint = null;
         try {
             if (con == null) {
                 if (!efi.ecfi.transactionFacade.isTransactionInPlace())
                     began = efi.ecfi.transactionFacade.begin(60);
-                con = efi.getConnection(groupName);
+                con = efi.getConnectionInternal(groupName, false);
                 close = true;
             }
-            if ("h2-native".equals(style)) ensureH2(con, ed, fields);
+            // On a shared connection a failed statement must not leave the caller's transaction aborted (PostgreSQL)
+            if (sharedCon != null) {
+                try { if (!con.getAutoCommit()) savepoint = con.setSavepoint(); }
+                catch (SQLException ignored) { savepoint = null; }
+            }
+            if ("h2-native".equals(style)) ensureH2(con, ed, fields, columnsChanged);
             else if ("postgres-tsvector".equals(style)) ensurePostgres(con, databaseNode, ed, fields);
             else if ("mysql-fulltext".equals(style)) ensureMysql(con, ed, fields);
             else if ("mssql-contains".equals(style) || "oracle-text".equals(style)) {
                 warnOnce(groupName, style + " finds use SQL LIKE until a full-text catalog is added");
                 FtsSql.disable(groupName);
             }
+            if (savepoint != null) { try { con.releaseSavepoint(savepoint); } catch (SQLException ignored) { } }
             if (began) efi.ecfi.transactionFacade.commit();
         } catch (Throwable t) {
             logger.warn("FTS setup failed for {} ({}): {}", ed.getFullEntityName(), style, t.getMessage());
             FtsSql.disable(groupName);
+            if (savepoint != null) { try { con.rollback(savepoint); } catch (SQLException ignored) { } }
             if (began) {
                 try { efi.ecfi.transactionFacade.rollback(began, "FTS setup", t); }
                 catch (Throwable ignored) { }
@@ -89,12 +108,19 @@ public final class FtsDdl {
         }
     }
 
-    private static void ensureH2(Connection con, EntityDefinition ed, List<FieldInfo> fields) throws SQLException {
+    private static void ensureH2(Connection con, EntityDefinition ed, List<FieldInfo> fields, boolean columnsChanged) throws SQLException {
         String schema = ed.entityInfo.schemaName != null && !ed.entityInfo.schemaName.isEmpty()
                 ? ed.entityInfo.schemaName : "PUBLIC";
         String table = ed.getTableName();
         String key = schema + "." + table;
         FullText.init(con);
+        if (columnsChanged) {
+            H2_READY.remove(key);
+            if (indexExists(con, schema, table)) {
+                FullText.dropIndex(con, schema, table);
+                logger.info("Dropped H2 full-text index on {}.{} to rebuild it after columns were added", schema, table);
+            }
+        }
         if (H2_READY.contains(key)) return;
         StringBuilder cols = new StringBuilder();
         for (FieldInfo fi : fields) {
