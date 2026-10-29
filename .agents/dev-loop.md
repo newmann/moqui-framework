@@ -60,9 +60,9 @@ and EntityDataFind.
 
 ## Service
 
-Always defined in `service/*.xml`. Prefer XML `<actions>`. Alternatives:
-inline Groovy `<script>`, external `type="script" location="component://..."`,
-or a compiled class (`src/` has no automatic `ec`).
+Always defined in `service/*.xml`. The body defaults to XML `<actions>`
+(see `.agents/skills/moqui-xml-dsls/references/service.md`). Use inline
+Groovy `<script>` only when the logic is complex and XML is a poor fit.
 
 Naming: file `service/mantle/order/OrderServices.xml` plus
 `<service verb="get" noun="OrderInfo">` is

@@ -4,8 +4,10 @@ XSD: `framework/xsd/xml-screen-3.xsd` (forms in `xml-form-3.xsd`).
 Screens hot-reload; **`MoquiConf.xml` mount does not** — restart.
 
 **Generating or editing screens:** also read
-[screen-ui-patterns.md](screen-ui-patterns.md) — FK display names, inline
-`form-single` layout, and SimpleScreens template reuse.
+[screen-ui-patterns.md](screen-ui-patterns.md) — FK display names, browse
+lists (`form-list` plus `search-form-inputs`), CRUD lists (create
+`container-dialog`, in-list edit, or dedicated `Edit*.xml`), and
+SimpleScreens template reuse.
 
 The menu URL is the `subscreens-item@name` on
 `component://webroot/screen/webroot/apps.xml`, not the file name alone.
@@ -15,17 +17,15 @@ Subscreen sources (later wins): directory `subscreens/`, screen XML
 `<subscreens-item>`, component `MoquiConf.xml`, then DB
 `moqui.screen.SubscreensItem` (legacy).
 
+Browse and queue lists use `form-list` with `entity-find` and
+`header-field`, not a sibling Find `form-single`. See
+[screen-ui-patterns.md](screen-ui-patterns.md) section 2.
+
 ```xml
 <!-- good: simple app root; mount it in MoquiConf.xml -->
 <screen default-menu-title="My App" require-authentication="true"
         menu-image="fa fa-folder" menu-image-type="icon">
-    <widgets>
-        <form-single name="FindWidget" transition="search">
-            <field name="widgetName"><default-field><text-line/></default-field></field>
-            <field name="submit"><default-field title="Find">
-                <submit icon="fa fa-search"/></default-field></field>
-        </form-single>
-    </widgets>
+    <widgets/>
 </screen>
 ```
 
@@ -44,14 +44,23 @@ Subscreen sources (later wins): directory `subscreens/`, screen XML
 ```
 
 ```xml
-<!-- bad: every sub-form behind container-dialog on an edit page -->
-<container-dialog id="AddItemDialog" button-text="Add Item">
-    <form-single name="AddItemForm" transition="addItem">...</form-single>
+<!-- bad: create or edit form-single tiled under the form-list -->
+<form-list name="ItemList" list="itemList" skip-form="true">...</form-list>
+<form-single name="EditItemForm" map="selectedItem" transition="updateItem">...</form-single>
+<form-single name="CreateItemForm" transition="createItem">...</form-single>
+<!-- good: create dialog before the list; few fields edit on the list
+     (see screen-ui-patterns.md). Many fields go to EditItem.xml. -->
+<container-dialog id="CreateItemDialog" button-text="Create Item">
+    <form-single name="CreateItemForm" transition="createItem">
+        <field name="submitButton"><default-field title="Create">
+            <submit icon="fa fa-plus"/></default-field></field>
+    </form-single>
 </container-dialog>
-<!-- good: inline form-single above form-list (see screen-ui-patterns.md) -->
-<section name="AddItemSection"><widgets>
-    <form-single name="AddItemForm" transition="addItem">...</form-single>
-</widgets></section>
+<form-list name="ItemList" list="itemList" transition="updateItem">
+    <field name="itemName"><default-field><text-line/></default-field></field>
+    <field name="submitButton"><default-field title="Update">
+        <submit icon="fa fa-save"/></default-field></field>
+</form-list>
 ```
 
 ```xml
@@ -65,6 +74,9 @@ Subscreen sources (later wins): directory `subscreens/`, screen XML
 - Screens display and transition. Business work goes through
   `<service-call>` in a transition (or a service it calls), not inline
   in widgets. After a form submit that changes data, redirect.
+  A `<service-call>` inside `<actions>` must set `in-map="context"` or an
+  explicit map. A `<service-call>` that is a direct child of
+  `<transition>` gets `in-map="true"` automatically.
 - `form-single` for one record; `form-list` for tables. Both need a
   `transition` for submits.
 - Protect the app root with `AppSeedData.xml` (`AT_XML_SCREEN`,

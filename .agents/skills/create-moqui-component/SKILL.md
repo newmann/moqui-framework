@@ -188,7 +188,8 @@ same two attributes on every visible subscreen's `<screen>`, not on
 
 Before adding Find/Edit screens: read
 `.agents/skills/moqui-xml-dsls/references/screen-ui-patterns.md` (FK
-widgets, inline forms, SimpleScreens includes). Search
+widgets, CRUD lists: create dialog, in-list edit, or dedicated Edit
+screen, SimpleScreens includes). Search
 `runtime/component/SimpleScreens` for matching `Edit*.xml` and
 `template/` before writing new forms.
 

@@ -4,8 +4,25 @@ XSD: `framework/xsd/service-definition-3.xsd`. File path is the namespace:
 `service/my/app/Services.xml` plus `<service verb="get" noun="Widget">`
 → `my.app.Services.get#Widget`.
 
-Prefer `<actions>` XML. `src/` compiled classes do **not** get `ec`
-automatically. Scripts: `type="script" location="component://..."`.
+## Service body
+
+Write the body in `<actions>`, the way
+`runtime/component/mantle-usl/service` does. Use `entity-find` /
+`entity-find-one`, `if`, `set`, `iterate`, `service-call`,
+`entity-make-value`, `entity-create` / `entity-update` /
+`entity-delete`, and `return`. Short expressions on `from` and
+`condition` are fine (`from="a ?: b"`).
+
+Finds, branches, and writes that those operations can express stay in
+XML. Do not move that work into a Groovy class under `src/` (compiled
+classes do not get `ec` automatically) or an external
+`type="script" location="component://..."`.
+
+When the logic is complex and XML is a poor fit, use an inline
+`<script>` for that part only. Examples: JSON parse or serialize, a
+regex split, a graph walk, YAML or zip, nested loops, temporary
+structures, and calculations that are awkward as XML operations. Keep
+the surrounding flow in `<actions>`.
 
 ```xml
 <!-- good -->
